@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=kotoshelf
+Comment=Fast, minimalist markdown note editor and personal knowledge base
+Exec=/usr/bin/kotoshelf %F
+Icon=kotoshelf
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;text/plain;inode/directory;
+StartupWMClass=kotoshelf

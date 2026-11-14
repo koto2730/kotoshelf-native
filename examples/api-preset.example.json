@@ -1,0 +1,44 @@
+{
+  "presets": [
+    {
+      "name": "Chat completion (OpenAI compatible)",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "method": "POST",
+      "headers": [
+        ["Authorization", "Bearer {{tokens.OPENAI_KEY}}"],
+        ["Content-Type", "application/json"]
+      ],
+      "promptTemplate": "次の文章を要約してください。ファイル名: {{filename}}",
+      "bodyTemplate": "{\"model\": \"gpt-4o-mini\", \"messages\": [{\"role\": \"user\", \"content\": \"{{selectionJson}}\"}]}",
+      "responseJsonPath": "choices.0.message.content",
+      "responseTarget": "afterSelection",
+      "timeoutSecs": 60
+    },
+    {
+      "name": "Session based API",
+      "url": "https://example.com/api/chat",
+      "method": "POST",
+      "headers": [
+        ["Authorization", "Bearer {{tokens.EXAMPLE_KEY}}"],
+        ["Content-Type", "application/json"]
+      ],
+      "bodyTemplate": "{\"input\": \"{{selectionJson}}\", \"session\": {{sessionIdJson}}}",
+      "responseJsonPath": "reply",
+      "responseTarget": "newTab",
+      "sessionIdPath": "session.id",
+      "timeoutSecs": 30
+    }
+  ],
+  "tokens": {},
+  "sshProfiles": [
+    {
+      "name": "my-server",
+      "host": "example.com",
+      "port": 22,
+      "user": "me",
+      "identityFile": "~/.ssh/id_ed25519",
+      "remotePath": "/home/me/notes"
+    }
+  ],
+  "sshCommandPath": ""
+}
