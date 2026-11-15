@@ -668,8 +668,6 @@ struct SshConnectOutcome {
     agent: Option<ssh::AgentSession>,
     tree: Result<Vec<TreeNode>, String>,
     agent_connected: bool,
-    /// The profile with its Remote folder resolved to an absolute path.
-    profile: Option<ssh::SshProfile>,
 }
 
 /// "Open Remote Workspace…" dialog state. Profile CRUD is entirely
@@ -684,7 +682,9 @@ struct RemoteDialogState {
 
 fn ssh_display_target(profile: &ssh::SshProfile) -> String {
     let user = profile.user.as_deref().map(|u| format!("{u}@")).unwrap_or_default();
-    format!("{user}{}:{}", profile.host, profile.remote_path)
+    // "." is the normalized "login home" root (see ssh::normalize_remote_folder).
+    let folder = if profile.remote_path == "." { "~" } else { profile.remote_path.as_str() };
+    format!("{user}{}:{folder}", profile.host)
 }
 
 fn generate_duplicate_name(name: &str) -> String {
@@ -1011,22 +1011,21 @@ impl KotoshelfApp {
     /// why this can't just block the UI thread like the local
     /// equivalent (`open_folder`) does.
     pub(crate) fn open_ssh_workspace(&mut self, profile: ssh::SshProfile) {
-        if let Err(e) = ssh::check_remote_folder(&profile.remote_path) {
-            self.status = e;
-            return;
-        }
+        // Empty / `~` Remote folder = whatever ssh lands in (the login
+        // user's home); see `ssh::normalize_remote_folder`.
+        let profile = match ssh::normalize_remote_folder(&profile) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
         ssh::agent_disconnect(&mut self.ssh_agent);
         self.workspace = None;
         self.has_git_repo = false;
         self.kotoshelf_dir_policy = KotoshelfDirPolicy::Undecided;
         self.gitignore_confirm_dialog = None;
-        // An empty or `~` Remote folder means "the login user's home" and is
-        // resolved to an absolute path on the worker thread below; until
-        // then no profile is active, so nothing can act on an unresolved
-        // (empty) root.
-        let raw_folder = profile.remote_path.trim();
-        let needs_resolve = raw_folder.is_empty() || raw_folder.starts_with('~');
-        self.ssh_profile = if needs_resolve { None } else { Some(profile.clone()) };
+        self.ssh_profile = Some(profile.clone());
         self.tree = Vec::new();
         self.wiki_target_set.clear();
         self.wiki_target_set_ready = false;
@@ -1035,22 +1034,14 @@ impl KotoshelfApp {
         let ssh_command_path = self.ssh_command_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let profile = match ssh::resolve_remote_folder(&ssh_command_path, &profile) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(SshConnectOutcome { agent: None, tree: Err(e), agent_connected: false, profile: None });
-                    return;
-                }
-            };
             let mut agent = ssh::agent_connect(&ssh_command_path, &profile).ok();
             let agent_connected = agent.is_some();
             let tree = match ssh::agent_read_tree(&mut agent, &profile) {
                 Some(result) => result,
                 None => ssh::read_tree(&ssh_command_path, &profile),
             };
-            let _ = tx.send(SshConnectOutcome { agent, tree, agent_connected, profile: Some(profile) });
-        });
-        self.ssh_connecting = Some(rx);
+            let _ = tx.send(SshConnectOutcome { agent, tree, agent_connected });
+        });        self.ssh_connecting = Some(rx);
     }
 
     /// Spawns a terminal outside the app (not embedded) already `cd`'d
@@ -4024,9 +4015,6 @@ impl eframe::App for KotoshelfApp {
         if let Some(rx) = &self.ssh_connecting {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    if let Some(p) = outcome.profile.clone() {
-                        self.ssh_profile = Some(p);
-                    }
                     self.ssh_agent = outcome.agent;
                     match outcome.tree {
                         Ok(tree) => {
@@ -4970,7 +4958,7 @@ impl eframe::App for KotoshelfApp {
                                         ui.end_row();
                                     } else if rp.is_empty() {
                                         ui.label("");
-                                        ui.weak("Empty = your home folder on the server (like plain `ssh host`). \"~/sub\" also works.");
+                                        ui.weak("Empty = where ssh lands (your home folder, like plain `ssh host`). \"~/sub\" also works.");
                                         ui.end_row();
                                     } else if rp == "/" {
                                         ui.label("");

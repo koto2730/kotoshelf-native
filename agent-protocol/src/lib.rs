@@ -390,6 +390,34 @@ mod tests {
         assert_eq!(out[1].children.as_ref().unwrap()[0].path, "sub/bar.md");
     }
 
+    /// A workspace rooted at "." (ssh's login directory): `read_dir(".")`
+    /// yields `./x` style paths, which must still come out root-relative.
+    #[test]
+    fn relativize_handles_a_dot_root() {
+        let nodes = vec![TreeNode {
+            name: "foo.md".into(),
+            path: "./foo.md".into(),
+            is_dir: false,
+            children: None,
+            size: 1,
+        }, TreeNode {
+            name: "sub".into(),
+            path: "./sub".into(),
+            is_dir: true,
+            children: Some(vec![TreeNode {
+                name: "bar.md".into(),
+                path: "./sub/bar.md".into(),
+                is_dir: false,
+                children: None,
+                size: 1,
+            }]),
+            size: 0,
+        }];
+        let out = relativize(nodes, Path::new("."));
+        assert_eq!(out[0].path, "foo.md");
+        assert_eq!(out[1].children.as_ref().unwrap()[0].path, "sub/bar.md");
+    }
+
     /// kotoshelf has a documented history of exactly this bug in the SSH
     /// path-handling code (a trailing-slash workspace root breaking
     /// root-relative paths) - `profile.remote_path` is free-typed by the

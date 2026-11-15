@@ -597,35 +597,25 @@ pub fn check_remote_folder(remote_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves an empty or `~`-relative Remote folder to an absolute path,
-/// like plain `ssh host` landing in the user's home directory: empty / `~`
-/// -> `$HOME`, `~/sub` -> `$HOME/sub`. Any other value is returned as-is.
-/// The returned profile is for this session only (the saved profile keeps
-/// its empty/`~` text).
-pub fn resolve_remote_folder(ssh_command_path: &str, profile: &SshProfile) -> Result<SshProfile, String> {
+/// Maps the dialog's Remote folder text to the root every remote command
+/// `cd`s into, leaving "where is home" entirely to ssh/the server: an
+/// empty value or `~` becomes `.` (ssh starts every command in the login
+/// user's home, exactly like plain `ssh host`), `~/sub` becomes `./sub`,
+/// anything else is kept as typed. No `$HOME` lookup and no guessed
+/// absolute path - an empty root can never turn into `/`.
+pub fn normalize_remote_folder(profile: &SshProfile) -> Result<SshProfile, String> {
     let raw = profile.remote_path.trim();
     check_remote_folder(raw)?;
-    let rest = if raw.is_empty() || raw == "~" {
-        ""
-    } else if let Some(r) = raw.strip_prefix("~/") {
-        r
+    let root = if raw.is_empty() || raw == "~" {
+        ".".to_string()
+    } else if let Some(sub) = raw.strip_prefix("~/") {
+        let sub = sub.trim_matches('/');
+        if sub.is_empty() { ".".to_string() } else { format!("./{sub}") }
     } else {
-        let mut p = profile.clone();
-        p.remote_path = raw.to_string();
-        return Ok(p);
+        raw.to_string()
     };
-    let sub = rest.trim_matches('/');
-    let script = if sub.is_empty() {
-        "cd \"$HOME\" && pwd".to_string()
-    } else {
-        format!("cd \"$HOME\"/{} && pwd", shell_quote(sub))
-    };
-    let home = run_ssh_capture(ssh_command_path, profile, &script)?.trim().to_string();
-    if !home.starts_with('/') {
-        return Err(format!("Could not resolve the home folder (got {home:?})"));
-    }
     let mut p = profile.clone();
-    p.remote_path = home;
+    p.remote_path = root;
     Ok(p)
 }
 
@@ -1065,6 +1055,23 @@ mod tests {
         for ok in ["", "~", "~/notes", "/", "/home/me/notes", "notes..bak", "~/a..b"] {
             assert!(check_remote_folder(ok).is_ok(), "should accept {ok:?}");
         }
+    }
+
+    #[test]
+    fn normalize_remote_folder_leaves_home_to_ssh() {
+        let n = |p: &str| {
+            let mut prof = SshProfile::new("t");
+            prof.remote_path = p.to_string();
+            normalize_remote_folder(&prof).map(|x| x.remote_path)
+        };
+        assert_eq!(n("").unwrap(), ".");
+        assert_eq!(n("  ").unwrap(), ".");
+        assert_eq!(n("~").unwrap(), ".");
+        assert_eq!(n("~/").unwrap(), ".");
+        assert_eq!(n("~/notes/").unwrap(), "./notes");
+        assert_eq!(n("/home/me/x").unwrap(), "/home/me/x");
+        assert_eq!(n("/").unwrap(), "/");
+        assert!(n("~/../x").is_err());
     }
 
     #[test]
