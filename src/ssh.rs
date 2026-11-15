@@ -48,7 +48,10 @@ impl SshProfile {
             port: None,
             user: None,
             identity_file: None,
-            remote_path: "/".to_string(),
+            // Deliberately empty: a blank folder must be filled in (the UI
+            // refuses to connect with it) instead of silently defaulting to
+            // the server's filesystem root.
+            remote_path: String::new(),
         }
     }
 }

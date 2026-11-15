@@ -2,6 +2,11 @@
 
 Fast, minimalist markdown note editor and personal knowledge base with Obsidian Tasks compatibility.
 
+## 開発動機
+
+Obsidianを便利に使っていて、便利だけどちょっと重いなと感じたので作ってみました。
+Obsidianの保管庫だけでなく、リポジトリでの簡単なソース編集などにも使えるといいなと考えています。
+
 サンプルは [`examples/`](examples/) にあります。ワークスペースのルートにコピーしてそのまま試せます。
 
 - [ワークスペース](#ワークスペース)
@@ -28,7 +33,8 @@ Git リポジトリでは、初回に `.kotoshelf/` を作成してよいか、`
 
 ## テンプレート
 
-`Templates/` フォルダ（大文字小文字は問わない）の直下にある、`template_` で始まるファイルがテンプレートです。
+**ワークスペースのルート直下**の `Templates/` フォルダ（大文字小文字は問わない）の中にある、`template_` で始まるファイルがテンプレートです。
+サブフォルダの中の `Templates/`（例: `notes/Templates/`）や、`Templates/` の下のさらに深い階層にあるファイルは無視されます。
 
 ```
 Templates/template_daily.md      → 一覧では "daily"
@@ -56,7 +62,7 @@ Templates/template_reading.md    → 一覧では "reading"
 
 ワークスペースを開くと、`Templates/template_index.md` があれば、そのテンプレートからワークスペース直下に `index.md` を作って開きます。
 
-- `template_index.md` が **ない**場合は何もしません（`template_homepage.md` などは無視されます）。
+- ルート直下の `Templates/template_index.md` が **ない**場合は、`index.md` を作りません（何もしません）。`template_homepage.md` や、サブフォルダ内の `Templates/template_index.md` は無視されます。
 - `index.md` の作成日または更新日が**今日**なら、上書きせずそのまま開きます。編集内容は消えません。
 - 日付が変わった最初の起動では、テンプレートから作り直します。`{{today}}` や `{{task:...}}` が最新になります。
 - 展開の仕様は通常のテンプレートと同じです（変数、`{{task}}` ともに使えます）。
@@ -209,7 +215,7 @@ API 送信はワークスペースの種類（ローカル / SSH）に関係な�
 | Name | プロファイル名（`kotoshelf --ssh <Name>` で使う） |
 | Host | ホスト名、または `~/.ssh/config` の Host 別名 |
 | Port / User / Identity file | 任意。空なら `~/.ssh/config` の設定に従います |
-| Remote path | 開くリモートのフォルダ（絶対パス） |
+| Remote folder | 開くリモートのフォルダ（絶対パス・必須）。空だと接続できません。`/` を指定するとサーバー全体が見えるため警告が出ますが、接続はできます |
 
 - `ssh` コマンドの場所を変えたいときは、ダイアログで指定します（空なら PATH の `ssh`）。
 - 認証は `BatchMode` です。パスワード入力のプロンプトには対応していません。

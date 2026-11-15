@@ -18,6 +18,28 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::collections::HashMap;
 use egui::{Key, Modifiers};
 
+/// Rejects a user-typed file/folder name that would escape the folder it is
+/// created in: empty, absolute (`/x`, `\x`), drive-prefixed (`C:x`), or
+/// containing a `..` segment (either separator). Sub-folders (`sub/new.md`)
+/// are still allowed.
+fn validate_entry_name(name: &str) -> Result<(), String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("Name must not be empty.".to_string());
+    }
+    if n.starts_with('/') || n.starts_with('\\') {
+        return Err(format!("Name must be relative to the current folder: {name}"));
+    }
+    let first = n.split(['/', '\\']).next().unwrap_or("");
+    if first.contains(':') {
+        return Err(format!("Name must not start with a drive prefix: {name}"));
+    }
+    if n.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(format!("Name must not contain \"..\": {name}"));
+    }
+    Ok(())
+}
+
 /// Platform-formatted shortcut text; `;` is shown as a symbol rather than "Semicolon".
 fn shortcut_text(ui: &egui::Ui, mods: Modifiers, key: Key) -> String {
     let text = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(mods, key));
@@ -987,6 +1009,10 @@ impl KotoshelfApp {
     /// why this can't just block the UI thread like the local
     /// equivalent (`open_folder`) does.
     pub(crate) fn open_ssh_workspace(&mut self, profile: ssh::SshProfile) {
+        if profile.remote_path.trim().is_empty() {
+            self.status = "SSH profile has no remote folder set.".to_string();
+            return;
+        }
         ssh::agent_disconnect(&mut self.ssh_agent);
         self.workspace = None;
         self.has_git_repo = false;
@@ -1198,6 +1224,21 @@ impl KotoshelfApp {
     }
 
     fn apply_name_prompt(&mut self, action: NamePromptAction, name: String) {
+        // New/rename/duplicate names must stay inside the folder they are
+        // created in. Move/MoveBulk take a destination path by design and
+        // are handled by their own logic.
+        if matches!(
+            action,
+            NamePromptAction::NewFile { .. }
+                | NamePromptAction::NewFolder { .. }
+                | NamePromptAction::Rename { .. }
+                | NamePromptAction::Duplicate { .. }
+        ) {
+            if let Err(e) = validate_entry_name(&name) {
+                self.status = e;
+                return;
+            }
+        }
         match action {
             NamePromptAction::NewFile { dir } => self.create_new_file(&dir, &name),
             NamePromptAction::NewFolder { dir } => self.create_new_folder(&dir, &name),
@@ -2461,9 +2502,10 @@ pub(crate) fn resolve_media_uri(
             return;
         };
 
+        let template_root = if self.ssh_profile.is_some() { None } else { self.workspace.as_ref().map(|d| d.to_string_lossy().into_owned()) };
         let mut choices: Vec<(String, String)> = all_paths
             .into_iter()
-            .filter(|p| templates::is_template_path(p))
+            .filter(|p| templates::is_template_path(p, template_root.as_deref()))
             .map(|p| (templates::display_name(&p), p))
             .collect();
         if choices.is_empty() {
@@ -3268,9 +3310,9 @@ pub(crate) fn resolve_media_uri(
         };
 
         // template_index.md のみを展開対象とし、存在しない場合は何もしない
-        let Some(template_path_str) = all_paths.into_iter().find(|p| {
-            p.to_lowercase().replace('\\', "/").contains("templates/template_index.md")
-        }) else {
+        // ワークスペース直下の Templates/ のみが対象（サブフォルダ内の Templates/ は無視）
+        let template_root = if is_ssh { None } else { Some(root.display_string()) };
+        let Some(template_path_str) = templates::find_index_template(&all_paths, template_root.as_deref()) else {
             return;
         };
 
@@ -4902,6 +4944,20 @@ impl eframe::App for KotoshelfApp {
                                     ui.label("Remote folder");
                                     ui.text_edit_singleline(&mut profile.remote_path);
                                     ui.end_row();
+
+                                    let rp = profile.remote_path.trim();
+                                    if rp.is_empty() {
+                                        ui.label("");
+                                        ui.colored_label(egui::Color32::from_rgb(200, 60, 60), "Enter the remote folder to open (required).");
+                                        ui.end_row();
+                                    } else if rp == "/" {
+                                        ui.label("");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 140, 0),
+                                            "⚠ \"/\" opens the server's entire filesystem as the workspace.",
+                                        );
+                                        ui.end_row();
+                                    }
                                 });
                             } else {
                                 ui.label("Add a profile to get started.");
@@ -4917,7 +4973,7 @@ impl eframe::App for KotoshelfApp {
                             save_config = true;
                             close_dialog = true;
                         }
-                        let can_connect = dialog.profiles.get(dialog.selected).map(|p| !p.host.is_empty()).unwrap_or(false);
+                        let can_connect = dialog.profiles.get(dialog.selected).map(|p| !p.host.is_empty() && !p.remote_path.trim().is_empty()).unwrap_or(false);
                         if ui.add_enabled(can_connect, egui::Button::new("Connect")).clicked() {
                             connect_target = dialog.profiles.get(dialog.selected).cloned();
                         }
@@ -7808,6 +7864,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_entry_name_rejects_escapes_but_allows_subfolders() {
+        for bad in ["", "  ", "../x.md", "a/../../x", "a\\..\\x", "/etc/x", "\\x", "C:\\x", "C:x"] {
+            assert!(crate::app::validate_entry_name(bad).is_err(), "should reject {bad:?}");
+        }
+        for ok in ["note.md", "sub/new.md", "a b/c.md", "..hidden", "日本語.md", "v1.2..3.md"] {
+            assert!(crate::app::validate_entry_name(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
     fn ensure_and_open_homepage_follows_template_index_rules() {
         let dir = std::env::temp_dir().join(format!(
             "kotoshelf_index_template_rules_{}",
@@ -7826,6 +7892,17 @@ mod tests {
         app.open_workspace_at(dir.clone());
         assert!(!dir.join("index.md").exists());
         assert!(app.tabs.is_empty());
+
+        // 1b. ルート直下でない Templates/ 内の template_index.md は無視 -> なにもせず
+        std::fs::create_dir_all(dir.join("notes").join("Templates")).unwrap();
+        std::fs::write(
+            dir.join("notes").join("Templates").join("template_index.md"),
+            "# Nested {{today}}\n",
+        )
+        .unwrap();
+        let mut app_nested = KotoshelfApp::new();
+        app_nested.open_workspace_at(dir.clone());
+        assert!(!dir.join("index.md").exists());
 
         // 2. template_index.md 有り & index.md 無し -> template_index.md から新規作成
         std::fs::write(

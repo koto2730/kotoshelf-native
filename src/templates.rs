@@ -26,20 +26,46 @@
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use regex::Regex;
 
-/// `true` for a file directly inside a folder named `Templates` whose
-/// name starts with `template_` - the convention the user's own
-/// workspace already follows (`Templates/template_daily.md`,
-/// `Templates/template_reading.md`). Works for both a local absolute
-/// path and an SSH workspace-relative POSIX path, since both are just
-/// `/`- or `\`-separated path strings.
-pub fn is_template_path(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let in_templates_dir =
-        p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().eq_ignore_ascii_case("templates")).unwrap_or(false);
-    let name_prefixed = p.file_name().map(|n| n.to_string_lossy().starts_with("template_")).unwrap_or(false);
-    in_templates_dir && name_prefixed
+/// `true` for a file directly inside the workspace-root `Templates/`
+/// folder (name matched case-insensitively) whose own name starts with
+/// `template_` - e.g. `Templates/template_daily.md`. A `Templates` folder
+/// anywhere else (`notes/Templates/...`) is ignored.
+///
+/// `root` is the workspace root for a local workspace (`path` is then an
+/// absolute path under it); `None` for an SSH workspace, whose paths are
+/// already workspace-relative POSIX paths.
+pub fn is_template_path(path: &str, root: Option<&str>) -> bool {
+    let norm = |s: &str| s.replace('\\', "/");
+    let p = norm(path);
+    let rel = match root {
+        Some(r) => {
+            let r = norm(r);
+            let r = r.trim_end_matches('/');
+            let prefix = format!("{r}/");
+            if p.len() <= prefix.len() || !p[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                return false;
+            }
+            p[prefix.len()..].to_string()
+        }
+        None => p.trim_start_matches("./").to_string(),
+    };
+    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() == 2 && parts[0].eq_ignore_ascii_case("templates") && parts[1].starts_with("template_")
 }
 
+/// The root `Templates/template_index.md` among `paths`, if any (see
+/// `is_template_path` for the root-only rule).
+pub fn find_index_template(paths: &[String], root: Option<&str>) -> Option<String> {
+    paths
+        .iter()
+        .find(|p| {
+            is_template_path(p, root)
+                && std::path::Path::new(p.as_str())
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("template_index.md"))
+        })
+        .cloned()
+}
 /// The picker's display label for a template file - `template_` prefix
 /// and extension both stripped (`template_daily.md` -> `daily`), so the
 /// list reads as a plain menu of template names rather than filenames.
@@ -113,15 +139,18 @@ mod tests {
 
     #[test]
     fn recognizes_a_prefixed_file_directly_inside_a_templates_folder() {
-        assert!(is_template_path("C:\\ws\\Templates\\template_daily.md"));
-        assert!(is_template_path("Templates/template_reading.md")); // SSH-style relative POSIX path
+        assert!(is_template_path("C:\\ws\\Templates\\template_daily.md", Some("C:\\ws")));
+        assert!(is_template_path("Templates/template_reading.md", None)); // SSH-style relative POSIX path
     }
 
     #[test]
     fn rejects_files_outside_templates_or_without_the_prefix() {
-        assert!(!is_template_path("C:\\ws\\notes\\template_daily.md")); // wrong folder
-        assert!(!is_template_path("C:\\ws\\Templates\\daily.md")); // missing prefix
-        assert!(!is_template_path("C:\\ws\\Templates\\sub\\template_daily.md")); // nested, not direct
+        assert!(!is_template_path("C:\\ws\\notes\\template_daily.md", Some("C:\\ws"))); // wrong folder
+        assert!(!is_template_path("C:\\ws\\Templates\\daily.md", Some("C:\\ws"))); // missing prefix
+        assert!(!is_template_path("C:\\ws\\Templates\\sub\\template_daily.md", Some("C:\\ws"))); // nested, not direct
+        assert!(!is_template_path("C:\\ws\\notes\\Templates\\template_daily.md", Some("C:\\ws"))); // Templates not at the root
+        assert!(!is_template_path("notes/Templates/template_daily.md", None));
+        assert!(!is_template_path("C:\\other\\Templates\\template_daily.md", Some("C:\\ws"))); // outside the workspace
     }
 
     #[test]
