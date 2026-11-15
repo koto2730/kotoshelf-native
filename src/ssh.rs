@@ -48,9 +48,8 @@ impl SshProfile {
             port: None,
             user: None,
             identity_file: None,
-            // Deliberately empty: a blank folder must be filled in (the UI
-            // refuses to connect with it) instead of silently defaulting to
-            // the server's filesystem root.
+            // Empty = the login user's home folder (resolved at connect time),
+            // never the server's filesystem root.
             remote_path: String::new(),
         }
     }
@@ -587,6 +586,49 @@ pub fn test_connection(ssh_command_path: &str, profile: &SshProfile) -> Result<S
     run_ssh_capture(ssh_command_path, profile, &script).map(|s| s.trim().to_string())
 }
 
+/// Validates a profile's "Remote folder" text: any `..` segment is refused
+/// (so `~/..` or `/home/me/../other` can never climb out of where the user
+/// pointed the workspace). Empty, `~` / `~/sub` (home-relative) and absolute
+/// paths are fine.
+pub fn check_remote_folder(remote_path: &str) -> Result<(), String> {
+    if remote_path.split(['/', '\\']).any(|seg| seg.trim() == "..") {
+        return Err("Remote folder must not contain \"..\".".to_string());
+    }
+    Ok(())
+}
+
+/// Resolves an empty or `~`-relative Remote folder to an absolute path,
+/// like plain `ssh host` landing in the user's home directory: empty / `~`
+/// -> `$HOME`, `~/sub` -> `$HOME/sub`. Any other value is returned as-is.
+/// The returned profile is for this session only (the saved profile keeps
+/// its empty/`~` text).
+pub fn resolve_remote_folder(ssh_command_path: &str, profile: &SshProfile) -> Result<SshProfile, String> {
+    let raw = profile.remote_path.trim();
+    check_remote_folder(raw)?;
+    let rest = if raw.is_empty() || raw == "~" {
+        ""
+    } else if let Some(r) = raw.strip_prefix("~/") {
+        r
+    } else {
+        let mut p = profile.clone();
+        p.remote_path = raw.to_string();
+        return Ok(p);
+    };
+    let sub = rest.trim_matches('/');
+    let script = if sub.is_empty() {
+        "cd \"$HOME\" && pwd".to_string()
+    } else {
+        format!("cd \"$HOME\"/{} && pwd", shell_quote(sub))
+    };
+    let home = run_ssh_capture(ssh_command_path, profile, &script)?.trim().to_string();
+    if !home.starts_with('/') {
+        return Err(format!("Could not resolve the home folder (got {home:?})"));
+    }
+    let mut p = profile.clone();
+    p.remote_path = home;
+    Ok(p)
+}
+
 // ---------------------------------------------------------------------
 // Workspace-wide search & replace
 // ---------------------------------------------------------------------
@@ -1013,6 +1055,16 @@ mod tests {
     fn validate_rel_path_rejects_parent_dir_escapes() {
         assert!(validate_rel_path("../../etc/passwd").is_err());
         assert!(validate_rel_path("notes/../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn remote_folder_rejects_parent_segments_but_allows_home_and_absolute() {
+        for bad in ["..", "~/..", "~/../x", "/home/me/../other", "a\\..\\b"] {
+            assert!(check_remote_folder(bad).is_err(), "should reject {bad:?}");
+        }
+        for ok in ["", "~", "~/notes", "/", "/home/me/notes", "notes..bak", "~/a..b"] {
+            assert!(check_remote_folder(ok).is_ok(), "should accept {ok:?}");
+        }
     }
 
     #[test]
