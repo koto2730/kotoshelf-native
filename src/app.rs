@@ -1098,7 +1098,11 @@ impl KotoshelfApp {
         let ssh_command_path = self.ssh_command_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut agent = ssh::agent_connect(&ssh_command_path, &profile).ok();
+            let mut agent = if profile.disable_agent {
+                None
+            } else {
+                ssh::agent_connect(&ssh_command_path, &profile).ok()
+            };
             let agent_connected = agent.is_some();
             let mut tree = ssh::read_tree_shallow(&mut agent, &ssh_command_path, &profile, "");
             // If a root-level `Templates` folder exists, pre-fetch that single
@@ -4145,10 +4149,12 @@ impl eframe::App for KotoshelfApp {
                             self.tree = agent_protocol::filter_tree(tree);
                             self.rebuild_wiki_target_set();
                             if let Some(profile) = &self.ssh_profile {
-                                let note = if outcome.agent_connected {
+                                let note = if profile.disable_agent {
+                                    "agent disabled"
+                                } else if outcome.agent_connected {
                                     "agent connected"
                                 } else {
-                                    "agent unavailable, using per-operation SSH"
+                                    "agent unavailable, using shell session"
                                 };
                                 self.status = format!("Workspace (SSH): {} ({note})", ssh_display_target(profile));
                             }
@@ -5148,6 +5154,13 @@ impl eframe::App for KotoshelfApp {
                                         );
                                         ui.end_row();
                                     }
+
+                                    ui.label("Agent");
+                                    ui.checkbox(
+                                        &mut profile.disable_agent,
+                                        "Do not use remote agent (no ~/.kotoshelf/agent)",
+                                    );
+                                    ui.end_row();
                                 });
                             } else {
                                 ui.label("Add a profile to get started.");

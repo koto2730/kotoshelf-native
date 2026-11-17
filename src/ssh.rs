@@ -38,6 +38,10 @@ pub struct SshProfile {
     #[serde(default)]
     pub identity_file: Option<String>,
     pub remote_path: String,
+    /// When `true`, never uploads or runs `~/.kotoshelf/agent/kotoshelf-agent-*`
+    /// on the remote server (uses only standard POSIX commands over SSH).
+    #[serde(default)]
+    pub disable_agent: bool,
 }
 
 impl SshProfile {
@@ -51,6 +55,7 @@ impl SshProfile {
             // Empty = the login user's home folder (resolved at connect time),
             // never the server's filesystem root.
             remote_path: String::new(),
+            disable_agent: false,
         }
     }
 }
@@ -1564,6 +1569,9 @@ fn resolve_agent_binary_bytes(triple: &str) -> Result<Vec<u8>, String> {
 /// `agent_read_tree_shallow` to use. Errors here are meant to be non-fatal
 /// to the caller: SSH still works without an agent via `read_tree_shallow`.
 pub fn agent_connect(ssh_command_path: &str, profile: &SshProfile) -> Result<AgentSession, String> {
+    if profile.disable_agent {
+        return Err("Agent is disabled for this profile".into());
+    }
     let probe = run_ssh_capture(ssh_command_path, profile, "uname -sm && printf '%s\\n' \"$HOME\"")?;
     let mut lines = probe.lines();
     let uname = lines.next().unwrap_or("").trim();
@@ -1887,5 +1895,14 @@ mod tests {
         let bytes = resolve_agent_binary_bytes("x86_64-unknown-linux-gnu").unwrap();
         assert!(bytes.len() > 100_000);
         assert_eq!(&bytes[0..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn agent_connect_skips_immediately_when_disable_agent_is_set() {
+        let mut p = SshProfile::new("no-agent");
+        p.host = "example.com".to_string();
+        p.disable_agent = true;
+        let err = agent_connect("nonexistent-ssh-bin", &p).err().unwrap();
+        assert!(err.contains("disabled"));
     }
 }
