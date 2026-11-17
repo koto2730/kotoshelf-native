@@ -152,7 +152,10 @@ fn ssh_common_args(profile: &SshProfile, multiplex: bool) -> Vec<String> {
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
     ];
-    if multiplex {
+    // Win32-OpenSSH fails with `getsockname failed: Not a socket` (0xffffffff)
+    // when ControlMaster=auto is passed. On Windows, connection reuse is
+    // handled by `ShellSession` / `AgentSession` over a persistent stdio pipe.
+    if multiplex && !cfg!(target_os = "windows") {
         if let Some(control_path) = ssh_control_path(profile) {
             args.push("-o".into());
             args.push("ControlMaster=auto".into());
@@ -195,19 +198,175 @@ fn ssh_base_command(ssh_command_path: &str, profile: &SshProfile, multiplex: boo
     cmd
 }
 
+struct SshAttemptError {
+    message: String,
+    /// `true` when `ssh` itself failed (exit code 255 / -1 or spawn failure),
+    /// rather than the remote command returning a non-zero exit code.
+    is_transport_error: bool,
+}
+
+// ---------------------------------------------------------------------
+// Persistent POSIX shell session over one `ssh -T` subprocess
+// ---------------------------------------------------------------------
+//
+// On Windows, OpenSSH does not support `ControlMaster`, and on macOS/ARM
+// remotes a local Windows machine may not have a cross-compiled
+// `kotoshelf-agent` binary. Keeping one persistent `ssh -T <host> sh`
+// subprocess open lets every `run_ssh_capture` call (`read_tree_shallow`,
+// `read_file_text_guarded`, `file_mtime_secs`, `create_dir`, `rename_path`,
+// `trash_path`, `list_all_paths`, etc.) execute in a single pipe round-trip
+// (~10ms) with zero new `ssh.exe` process spawns or TCP/SSH handshakes.
+
+struct ShellSession {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    key: String,
+    seq: u64,
+}
+
+impl Drop for ShellSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn shell_session_key(ssh_command_path: &str, profile: &SshProfile) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        ssh_command_path.trim(),
+        profile.host,
+        profile.port.unwrap_or(0),
+        profile.user.as_deref().unwrap_or(""),
+        profile.identity_file.as_deref().unwrap_or(""),
+    )
+}
+
+static SHELL_SESSION: std::sync::OnceLock<std::sync::Mutex<Option<ShellSession>>> =
+    std::sync::OnceLock::new();
+
+fn shell_session_slot() -> &'static std::sync::Mutex<Option<ShellSession>> {
+    SHELL_SESSION.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn shell_disconnect() {
+    if let Ok(mut guard) = shell_session_slot().lock() {
+        *guard = None;
+    }
+}
+
+impl ShellSession {
+    fn connect(ssh_command_path: &str, profile: &SshProfile) -> Result<Self, String> {
+        let bin = if ssh_command_path.trim().is_empty() { "ssh" } else { ssh_command_path.trim() };
+        let mut cmd = Command::new(bin);
+        cmd.arg("-T");
+        cmd.args(ssh_common_args(profile, false));
+        cmd.arg(ssh_target(profile));
+        cmd.arg("sh");
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to start ssh session: {e}"))?;
+        let stdin = child.stdin.take().ok_or("Failed to open ssh stdin")?;
+        let stdout = child.stdout.take().ok_or("Failed to open ssh stdout")?;
+        let stderr = child.stderr.take().ok_or("Failed to open ssh stderr")?;
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut sink = [0u8; 1024];
+            let mut stderr = stderr;
+            while let Ok(n) = stderr.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: std::io::BufReader::new(stdout),
+            key: shell_session_key(ssh_command_path, profile),
+            seq: 0,
+        })
+    }
+
+    fn exec(&mut self, remote_script: &str) -> Result<String, SshAttemptError> {
+        use std::io::BufRead;
+        self.seq += 1;
+        let marker = format!("__KOTOSHELF_EOF_{}_{}__", std::process::id(), self.seq);
+        let payload = format!(
+            "(\n{remote_script}\n) </dev/null\n__ks_rc=$?\nprintf '\\n{marker}:%d\\n' \"$__ks_rc\"\n"
+        );
+        self.stdin.write_all(payload.as_bytes()).map_err(|e| SshAttemptError {
+            message: format!("ssh write failed: {e}"),
+            is_transport_error: true,
+        })?;
+        self.stdin.flush().map_err(|e| SshAttemptError {
+            message: format!("ssh flush failed: {e}"),
+            is_transport_error: true,
+        })?;
+
+        let prefix = format!("{marker}:");
+        let mut out = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line).map_err(|e| SshAttemptError {
+                message: format!("ssh read failed: {e}"),
+                is_transport_error: true,
+            })?;
+            if n == 0 {
+                return Err(SshAttemptError {
+                    message: "ssh session closed unexpectedly".into(),
+                    is_transport_error: true,
+                });
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if let Some(rc_str) = trimmed.strip_prefix(&prefix) {
+                let rc: i32 = rc_str.trim().parse().unwrap_or(1);
+                if out.ends_with("\r\n") {
+                    out.truncate(out.len() - 2);
+                } else if out.ends_with('\n') {
+                    out.truncate(out.len() - 1);
+                }
+                if rc != 0 {
+                    return Err(SshAttemptError {
+                        message: format!("Remote command exited with status {rc}"),
+                        is_transport_error: false,
+                    });
+                }
+                return Ok(out);
+            }
+            out.push_str(&line);
+        }
+    }
+}
+
 fn run_ssh_capture_attempt(
     ssh_command_path: &str,
     profile: &SshProfile,
     remote_script: &str,
     multiplex: bool,
-) -> Result<String, String> {
+) -> Result<String, SshAttemptError> {
     let output = ssh_base_command(ssh_command_path, profile, multiplex)
         .arg(remote_script)
         .output()
-        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+        .map_err(|e| SshAttemptError { message: format!("Failed to run ssh: {e}"), is_transport_error: true })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+        let is_transport_error = matches!(output.status.code(), Some(255) | Some(-1));
+        return Err(SshAttemptError {
+            message: format!("ssh failed ({}): {}", output.status, stderr.trim()),
+            is_transport_error,
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -225,15 +384,35 @@ fn prepare_stale_socket_retry(profile: &SshProfile) {
     std::thread::sleep(std::time::Duration::from_secs(2));
 }
 
-/// On failure, retries once over a fresh, non-multiplexed connection.
-/// The retry's result (not the first attempt's) is what's reported.
+/// Executes `remote_script` over the persistent `ShellSession` first
+/// (one reused `ssh -T ... sh` connection), falling back to a one-shot
+/// `ssh` invocation if needed.
 fn run_ssh_capture(ssh_command_path: &str, profile: &SshProfile, remote_script: &str) -> Result<String, String> {
-    match run_ssh_capture_attempt(ssh_command_path, profile, remote_script, true) {
-        Ok(out) => Ok(out),
-        Err(_) => {
-            prepare_stale_socket_retry(profile);
-            run_ssh_capture_attempt(ssh_command_path, profile, remote_script, false)
+    if let Ok(mut guard) = shell_session_slot().lock() {
+        let key = shell_session_key(ssh_command_path, profile);
+        let needs_new = guard.as_ref().map(|s| s.key != key).unwrap_or(true);
+        if needs_new {
+            *guard = ShellSession::connect(ssh_command_path, profile).ok();
         }
+        if let Some(session) = guard.as_mut() {
+            match session.exec(remote_script) {
+                Ok(out) => return Ok(out),
+                Err(e) if !e.is_transport_error => return Err(e.message),
+                Err(_) => {
+                    *guard = None;
+                }
+            }
+        }
+    }
+
+    let use_multiplex = !cfg!(target_os = "windows");
+    match run_ssh_capture_attempt(ssh_command_path, profile, remote_script, use_multiplex) {
+        Ok(out) => Ok(out),
+        Err(e) if use_multiplex && e.is_transport_error => {
+            prepare_stale_socket_retry(profile);
+            run_ssh_capture_attempt(ssh_command_path, profile, remote_script, false).map_err(|e2| e2.message)
+        }
+        Err(e) => Err(e.message),
     }
 }
 
@@ -243,24 +422,30 @@ fn run_ssh_with_stdin_attempt(
     remote_script: &str,
     input: &[u8],
     multiplex: bool,
-) -> Result<(), String> {
+) -> Result<(), SshAttemptError> {
     let mut child = ssh_base_command(ssh_command_path, profile, multiplex)
         .arg(remote_script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+        .map_err(|e| SshAttemptError { message: format!("Failed to run ssh: {e}"), is_transport_error: true })?;
     child
         .stdin
         .as_mut()
-        .ok_or("Failed to open ssh stdin")?
+        .ok_or_else(|| SshAttemptError { message: "Failed to open ssh stdin".into(), is_transport_error: true })?
         .write_all(input)
-        .map_err(|e| format!("Failed to write to ssh stdin: {e}"))?;
-    let output = child.wait_with_output().map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|e| SshAttemptError { message: format!("Failed to write to ssh stdin: {e}"), is_transport_error: true })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| SshAttemptError { message: format!("ssh failed: {e}"), is_transport_error: true })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+        let is_transport_error = matches!(output.status.code(), Some(255) | Some(-1));
+        return Err(SshAttemptError {
+            message: format!("ssh failed ({}): {}", output.status, stderr.trim()),
+            is_transport_error,
+        });
     }
     Ok(())
 }
@@ -271,12 +456,14 @@ fn run_ssh_with_stdin(
     remote_script: &str,
     input: &[u8],
 ) -> Result<(), String> {
-    match run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, true) {
+    let use_multiplex = !cfg!(target_os = "windows");
+    match run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, use_multiplex) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(e) if use_multiplex && e.is_transport_error => {
             prepare_stale_socket_retry(profile);
-            run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, false)
+            run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, false).map_err(|e2| e2.message)
         }
+        Err(e) => Err(e.message),
     }
 }
 
@@ -289,25 +476,31 @@ fn run_ssh_capture_bytes_attempt(
     profile: &SshProfile,
     remote_script: &str,
     multiplex: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SshAttemptError> {
     let output = ssh_base_command(ssh_command_path, profile, multiplex)
         .arg(remote_script)
         .output()
-        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+        .map_err(|e| SshAttemptError { message: format!("Failed to run ssh: {e}"), is_transport_error: true })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+        let is_transport_error = matches!(output.status.code(), Some(255) | Some(-1));
+        return Err(SshAttemptError {
+            message: format!("ssh failed ({}): {}", output.status, stderr.trim()),
+            is_transport_error,
+        });
     }
     Ok(output.stdout)
 }
 
 fn run_ssh_capture_bytes(ssh_command_path: &str, profile: &SshProfile, remote_script: &str) -> Result<Vec<u8>, String> {
-    match run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, true) {
+    let use_multiplex = !cfg!(target_os = "windows");
+    match run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, use_multiplex) {
         Ok(out) => Ok(out),
-        Err(_) => {
+        Err(e) if use_multiplex && e.is_transport_error => {
             prepare_stale_socket_retry(profile);
-            run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, false)
+            run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, false).map_err(|e2| e2.message)
         }
+        Err(e) => Err(e.message),
     }
 }
 
@@ -387,17 +580,18 @@ fn ssh_prune_expr() -> String {
     format!("{named} -o \\( -type d -name '.*' \\)")
 }
 
-/// One `find` pass (dirs and files together) then a per-entry shell loop
-/// that tags each D(irectory)/F(ile) and sizes files via `stat -c%s`
-/// (GNU) falling back to `stat -f%z` (BSD/macOS) - deliberately not
-/// `wc -c`, which counts bytes by reading the whole file (hangs on a
-/// multi-GB file just to answer "how big is this").
+/// Tries GNU `find`'s built-in `-printf` first (zero shell loops or
+/// per-file `stat` subprocesses), falling back to a POSIX `find | while`
+/// loop using `stat -c%s` (GNU) / `stat -f%z` (BSD/macOS) when `-printf`
+/// is unsupported on the remote host.
 fn ssh_read_tree_script(remote_path: &str) -> String {
     let prune = ssh_prune_expr();
     let mut s = String::new();
     s.push_str("cd ");
     s.push_str(&shell_quote(remote_path));
-    s.push_str(" && find . -mindepth 1 \\( ");
+    s.push_str(" && (find . -mindepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o \\( -type d -printf 'D\\t0\\t%P\\n' -o -printf 'F\\t%s\\t%P\\n' \\) 2>/dev/null || (find . -mindepth 1 \\( ");
     s.push_str(&prune);
     s.push_str(" \\) -prune -o -print | while IFS= read -r p; do ");
     s.push_str("rel=${p#./}; ");
@@ -405,14 +599,289 @@ fn ssh_read_tree_script(remote_path: &str) -> String {
     s.push_str(
         "else printf 'F\\t%s\\t%s\\n' \"$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 18446744073709551615)\" \"$rel\"; fi; ",
     );
-    s.push_str("done");
+    s.push_str("done))");
     s
 }
 
+#[allow(dead_code)]
 pub fn read_tree(ssh_command_path: &str, profile: &SshProfile) -> Result<Vec<TreeNode>, String> {
     let script = ssh_read_tree_script(&profile.remote_path);
     let out = run_ssh_capture(ssh_command_path, profile, &script)?;
     Ok(parse_ssh_tree(&out))
+}
+
+/// Same "D\t0\tname" / "F\tsize\tname" line format as `ssh_read_tree_script`,
+/// but `-maxdepth 1`, scoped to one directory (`rel_path`, `""` for the
+/// workspace root) instead of walking the whole remote tree. Ported from
+/// the Tauri version's `ssh_read_tree_shallow_script`, with GNU `find -printf`
+/// tried first before falling back to the POSIX `while read` loop.
+fn ssh_read_tree_shallow_script(remote_path: &str, rel_path: &str) -> String {
+    let dir = if rel_path.is_empty() {
+        remote_path.to_string()
+    } else {
+        format!("{}/{rel_path}", remote_path.trim_end_matches('/'))
+    };
+    let prune = ssh_prune_expr();
+    let mut s = String::new();
+    s.push_str("cd ");
+    s.push_str(&shell_quote(&dir));
+    s.push_str(" && (find . -mindepth 1 -maxdepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o \\( -type d -printf 'D\\t0\\t%P\\n' -o -printf 'F\\t%s\\t%P\\n' \\) 2>/dev/null || (find . -mindepth 1 -maxdepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o -print | while IFS= read -r p; do ");
+    s.push_str("rel=${p#./}; ");
+    s.push_str("if [ -d \"$p\" ]; then printf 'D\\t0\\t%s\\n' \"$rel\"; ");
+    s.push_str(
+        "else printf 'F\\t%s\\t%s\\n' \"$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 18446744073709551615)\" \"$rel\"; fi; ",
+    );
+    s.push_str("done))");
+    s
+}
+
+/// Parses one level of "D\t0\tname" / "F\tsize\tname" lines (ported from
+/// Tauri's `parse_ssh_shallow`). Directories always come back with
+/// `children: None` ("not loaded yet") so expanding a folder in the UI
+/// knows to fetch its contents on demand.
+fn parse_ssh_shallow(raw: &str, base: &str) -> Vec<TreeNode> {
+    let mut nodes = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        let mut fields = line.splitn(3, '\t');
+        let (Some(marker), Some(size_str), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let size = size_str.trim().parse::<u64>().unwrap_or(0);
+        let path = if base.is_empty() {
+            name.to_string()
+        } else {
+            format!("{base}/{name}")
+        };
+        nodes.push(TreeNode {
+            name: name.to_string(),
+            path,
+            is_dir: marker == "D",
+            children: None,
+            size,
+        });
+    }
+    sort_tree_nodes(&mut nodes);
+    nodes
+}
+
+/// Lists one directory level (`rel_path`, `""` for workspace root), using
+/// the persistent SSH agent when connected and falling back to a shallow
+/// `find -maxdepth 1` over SSH.
+pub fn read_tree_shallow(
+    session: &mut Option<AgentSession>,
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    rel_path: &str,
+) -> Result<Vec<TreeNode>, String> {
+    validate_rel_path(rel_path)?;
+    if let Some(result) = agent_read_tree_shallow(session, profile, rel_path) {
+        return result.map(agent_protocol::filter_tree);
+    }
+    let script = ssh_read_tree_shallow_script(&profile.remote_path, rel_path);
+    let out = run_ssh_capture(ssh_command_path, profile, &script)?;
+    Ok(agent_protocol::filter_tree(parse_ssh_shallow(&out, rel_path)))
+}
+
+// ---------------------------------------------------------------------
+// Lazy tree splicing helpers (ported from Tauri's `src/lib/fs.ts`)
+// ---------------------------------------------------------------------
+
+pub fn sort_tree_nodes(nodes: &mut Vec<TreeNode>) {
+    nodes.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+/// Splices freshly-fetched `children` into the directory node at `dir_path`
+/// (`""` replaces the root vector itself).
+pub fn insert_tree_children(nodes: &mut Vec<TreeNode>, dir_path: &str, mut children: Vec<TreeNode>) {
+    sort_tree_nodes(&mut children);
+    if dir_path.is_empty() {
+        *nodes = children;
+        return;
+    }
+    for n in nodes.iter_mut() {
+        if n.path == dir_path {
+            n.children = Some(children);
+            return;
+        }
+        if let Some(sub) = &mut n.children {
+            insert_tree_children(sub, dir_path, children.clone());
+        }
+    }
+}
+
+/// Inserts or updates a single file node at `rel_path` in an already-loaded
+/// tree without a network round-trip. Unloaded parent folders (`children: None`)
+/// are left untouched so expanding them later fetches their real contents.
+pub fn insert_tree_file(nodes: &mut Vec<TreeNode>, rel_path: &str, size: u64) {
+    let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return;
+    }
+    let file_name = parts[parts.len() - 1];
+    insert_file_into(nodes, &parts[..parts.len() - 1], "", file_name, size);
+}
+
+fn insert_file_into(list: &mut Vec<TreeNode>, segments: &[&str], prefix: &str, file_name: &str, size: u64) {
+    if segments.is_empty() {
+        let file_path = if prefix.is_empty() {
+            file_name.to_string()
+        } else {
+            format!("{prefix}/{file_name}")
+        };
+        list.retain(|n| n.is_dir || n.name != file_name);
+        list.push(TreeNode {
+            name: file_name.to_string(),
+            path: file_path,
+            is_dir: false,
+            children: None,
+            size,
+        });
+        sort_tree_nodes(list);
+        return;
+    }
+    let head = segments[0];
+    let rest = &segments[1..];
+    for n in list.iter_mut() {
+        if n.is_dir && n.name == head {
+            if let Some(children) = &mut n.children {
+                let new_prefix = if prefix.is_empty() {
+                    head.to_string()
+                } else {
+                    format!("{prefix}/{head}")
+                };
+                insert_file_into(children, rest, &new_prefix, file_name, size);
+            }
+            return;
+        }
+    }
+}
+
+/// Inserts a brand-new empty directory at `rel_path` into an already-loaded
+/// parent in `nodes` without a network round-trip.
+pub fn insert_tree_dir(nodes: &mut Vec<TreeNode>, rel_path: &str) {
+    let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return;
+    }
+    let dir_name = parts[parts.len() - 1];
+    insert_dir_into(nodes, &parts[..parts.len() - 1], "", dir_name);
+}
+
+fn insert_dir_into(list: &mut Vec<TreeNode>, segments: &[&str], prefix: &str, dir_name: &str) {
+    if segments.is_empty() {
+        let dir_path = if prefix.is_empty() {
+            dir_name.to_string()
+        } else {
+            format!("{prefix}/{dir_name}")
+        };
+        if !list.iter().any(|n| n.is_dir && n.name == dir_name) {
+            list.push(TreeNode {
+                name: dir_name.to_string(),
+                path: dir_path,
+                is_dir: true,
+                children: Some(Vec::new()),
+                size: 0,
+            });
+            sort_tree_nodes(list);
+        }
+        return;
+    }
+    let head = segments[0];
+    let rest = &segments[1..];
+    for n in list.iter_mut() {
+        if n.is_dir && n.name == head {
+            if let Some(children) = &mut n.children {
+                let new_prefix = if prefix.is_empty() {
+                    head.to_string()
+                } else {
+                    format!("{prefix}/{head}")
+                };
+                insert_dir_into(children, rest, &new_prefix, dir_name);
+            }
+            return;
+        }
+    }
+}
+
+/// Removes the node at `path` from an already-loaded tree without a network round-trip.
+pub fn remove_tree_node(nodes: &mut Vec<TreeNode>, path: &str) {
+    nodes.retain(|n| n.path != path);
+    for n in nodes.iter_mut() {
+        if let Some(children) = &mut n.children {
+            remove_tree_node(children, path);
+        }
+    }
+}
+
+/// Renames a node at `from_path` to `to_path` in-place (when in the same
+/// parent directory), updating any already-loaded descendant paths. Returns
+/// `true` if handled in-place, `false` if moved across directories.
+pub fn rename_tree_node(nodes: &mut Vec<TreeNode>, from_path: &str, to_path: &str) -> bool {
+    let from_parent = from_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let to_parent = to_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    if from_parent != to_parent {
+        return false;
+    }
+    let to_name = to_path.rsplit('/').next().unwrap_or(to_path);
+    rename_in_list(nodes, from_path, to_path, to_name)
+}
+
+fn rename_in_list(list: &mut Vec<TreeNode>, from_path: &str, to_path: &str, to_name: &str) -> bool {
+    for n in list.iter_mut() {
+        if n.path == from_path {
+            n.name = to_name.to_string();
+            n.path = to_path.to_string();
+            if let Some(children) = &mut n.children {
+                rewrite_descendants(children, from_path, to_path);
+            }
+            sort_tree_nodes(list);
+            return true;
+        }
+        if let Some(children) = &mut n.children {
+            if rename_in_list(children, from_path, to_path, to_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn rewrite_descendants(list: &mut Vec<TreeNode>, from: &str, to: &str) {
+    let prefix = format!("{from}/");
+    for n in list.iter_mut() {
+        if let Some(rest) = n.path.strip_prefix(&prefix) {
+            n.path = format!("{to}/{rest}");
+        }
+        if let Some(children) = &mut n.children {
+            rewrite_descendants(children, from, to);
+        }
+    }
+}
+
+/// Collects relative paths of all directories in `nodes` whose `children`
+/// have already been loaded (`Some(...)`), in top-down order so refreshing
+/// them in sequence reconstructs the expanded tree state.
+pub fn collect_loaded_dir_paths(nodes: &[TreeNode], out: &mut Vec<String>) {
+    for n in nodes {
+        if n.is_dir {
+            if let Some(children) = &n.children {
+                out.push(n.path.clone());
+                collect_loaded_dir_paths(children, out);
+            }
+        }
+    }
 }
 
 /// Every file path in the workspace, `find`-only (no `stat`) - used for
@@ -447,13 +916,31 @@ pub fn read_file(ssh_command_path: &str, profile: &SshProfile, rel_path: &str) -
     run_ssh_capture(ssh_command_path, profile, &script)
 }
 
+/// Reads `rel_path` as UTF-8 text, guarded by `SSH_IMAGE_MAX_BYTES` (20 MB)
+/// in a single round-trip over the persistent `ShellSession` (`run_ssh_capture`)
+/// so opening text files in the tree is instant (~10ms) and refuses oversized files.
+pub fn read_file_text_guarded(ssh_command_path: &str, profile: &SshProfile, rel_path: &str) -> Result<String, String> {
+    validate_rel_path(rel_path)?;
+    let full = full_path(profile, rel_path);
+    let quoted = shell_quote(&full);
+    let script = format!(
+        "size=$(stat -c%s -- {quoted} 2>/dev/null || stat -f%z -- {quoted} 2>/dev/null || echo 0); \
+         if [ \"$size\" -gt {SSH_IMAGE_MAX_BYTES} ]; then printf 'TOOLARGE\\t%s\\n' \"$size\"; \
+         else printf 'OK\\n'; cat -- {quoted}; fi"
+    );
+    let out = run_ssh_capture(ssh_command_path, profile, &script)?;
+    let bytes = parse_guarded_response(out.as_bytes())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Modification time (Unix seconds) of `rel_path` on the remote, or `None`
 /// if it doesn't exist / can't be stat'ed. GNU `stat -c %Y` with a BSD/
-/// macOS `stat -f %m` fallback.
+/// macOS `stat -f %m` fallback. `|| true` ensures a missing file exits 0
+/// with empty output instead of failing the ssh invocation.
 pub fn file_mtime_secs(ssh_command_path: &str, profile: &SshProfile, rel_path: &str) -> Option<i64> {
     validate_rel_path(rel_path).ok()?;
     let p = shell_quote(&full_path(profile, rel_path));
-    let script = format!("stat -c %Y {p} 2>/dev/null || stat -f %m {p} 2>/dev/null");
+    let script = format!("stat -c %Y {p} 2>/dev/null || stat -f %m {p} 2>/dev/null || true");
     run_ssh_capture(ssh_command_path, profile, &script).ok()?.trim().parse().ok()
 }
 
@@ -579,11 +1066,87 @@ pub fn trash_path(ssh_command_path: &str, profile: &SshProfile, rel_path: &str) 
     run_ssh_capture(ssh_command_path, profile, &script).map(|_| ())
 }
 
-/// Round-trips `cd <remote_path> && pwd` so "Connect" surfaces an
-/// auth/host/path failure immediately instead of only on first file op.
-pub fn test_connection(ssh_command_path: &str, profile: &SshProfile) -> Result<String, String> {
-    let script = format!("cd {} && pwd", shell_quote(&profile.remote_path));
-    run_ssh_capture(ssh_command_path, profile, &script).map(|s| s.trim().to_string())
+#[derive(Clone, Debug)]
+pub struct SshTestOutput {
+    pub success: bool,
+    pub summary: String,
+    pub output: String,
+}
+
+/// Runs `ssh -vT <common_args> <target> "cd <remote_path> && pwd"` and
+/// captures both stdout and stderr so the user can inspect and copy the
+/// full `-vT` trace whether the connection succeeded or failed.
+pub fn test_connection_verbose(ssh_command_path: &str, profile: &SshProfile) -> SshTestOutput {
+    let norm = match normalize_remote_folder(profile) {
+        Ok(p) => p,
+        Err(e) => {
+            return SshTestOutput {
+                success: false,
+                summary: e.clone(),
+                output: e,
+            };
+        }
+    };
+
+    let bin = if ssh_command_path.trim().is_empty() { "ssh" } else { ssh_command_path.trim() };
+    let script = format!("cd {} && pwd", shell_quote(&norm.remote_path));
+    let mut args = vec!["-vT".to_string()];
+    args.extend(ssh_common_args(&norm, false));
+    args.push(ssh_target(&norm));
+    args.push(script);
+
+    let cmd_display = format!("{bin} {}", args.join(" "));
+    let mut cmd = Command::new(bin);
+    cmd.args(&args).stdin(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut combined = format!("$ {cmd_display}\n");
+            if !stdout.trim().is_empty() {
+                combined.push_str("\n--- stdout ---\n");
+                combined.push_str(stdout.trim_end());
+                combined.push('\n');
+            }
+            if !stderr.trim().is_empty() {
+                combined.push_str("\n--- stderr (-vT) ---\n");
+                combined.push_str(stderr.trim_end());
+                combined.push('\n');
+            }
+            let success = out.status.success();
+            let summary = if success {
+                let resolved = stdout.lines().last().unwrap_or("").trim();
+                if resolved.is_empty() {
+                    "Connection succeeded.".to_string()
+                } else {
+                    format!("Connection succeeded (remote folder: {resolved})")
+                }
+            } else {
+                format!("Connection test failed ({})", out.status)
+            };
+            SshTestOutput {
+                success,
+                summary,
+                output: combined,
+            }
+        }
+        Err(e) => {
+            let msg = format!("Failed to execute '{bin}': {e}");
+            SshTestOutput {
+                success: false,
+                summary: msg.clone(),
+                output: format!("$ {cmd_display}\n\n{msg}\n"),
+            }
+        }
+    }
 }
 
 /// Validates a profile's "Remote folder" text: any `..` segment is refused
@@ -712,6 +1275,37 @@ pub fn search_workspace(
         }
     }
     Ok(results)
+}
+
+/// Fetches every markdown file (`.md`, up to `SSH_SEARCH_MAX_FILE_BYTES`)
+/// in a single `ssh` round-trip so workspace-wide task scanning (`{{task}}`)
+/// doesn't spawn one `ssh` process per file.
+pub fn fetch_markdown_files(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+) -> Result<Vec<(String, String)>, String> {
+    let prune = ssh_prune_expr();
+    let mut script = String::new();
+    script.push_str("cd ");
+    script.push_str(&shell_quote(&profile.remote_path));
+    script.push_str(" && find . -mindepth 1 \\( ");
+    script.push_str(&prune);
+    script.push_str(" \\) -prune -o -type f \\( -name '*.md' -o -name '*.MD' \\) -print | while IFS= read -r p; do ");
+    script.push_str("rel=${p#./}; ");
+    script.push_str("size=$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 0); ");
+    script.push_str(&format!("if [ \"$size\" -le {SSH_SEARCH_MAX_FILE_BYTES} ]; then "));
+    script.push_str("printf '%s\\n%s\\n' \"$rel\" \"$size\"; cat -- \"$p\"; fi; ");
+    script.push_str("done");
+
+    let bytes = run_ssh_capture_bytes(ssh_command_path, profile, &script)?;
+    let raw_files = parse_search_fetch(&bytes);
+    let mut out = Vec::with_capacity(raw_files.len());
+    for (path, content_bytes) in raw_files {
+        if let Ok(content) = String::from_utf8(content_bytes) {
+            out.push((path, content));
+        }
+    }
+    Ok(out)
 }
 
 /// Replaces every match of `query` in each of `paths` (workspace-relative,
@@ -862,6 +1456,7 @@ impl Drop for AgentSession {
 /// `read_tree`). `Some(Err(...))` is still a real answer from the agent
 /// (e.g. "Not a directory"), not a reason to fall back further - only a
 /// connection-level problem drops the session.
+#[allow(dead_code)]
 pub fn agent_read_tree(session: &mut Option<AgentSession>, profile: &SshProfile) -> Option<Result<Vec<TreeNode>, String>> {
     let s = session.as_mut()?;
     if s.key != agent_session_key(profile) {
@@ -881,10 +1476,36 @@ pub fn agent_read_tree(session: &mut Option<AgentSession>, profile: &SshProfile)
     }
 }
 
-/// Ends the live agent session (if any): asks it to exit gracefully
-/// first (best-effort), then drops it (kills + waits on the local ssh
-/// child as a guaranteed backstop).
+pub fn agent_read_tree_shallow(
+    session: &mut Option<AgentSession>,
+    profile: &SshProfile,
+    rel_path: &str,
+) -> Option<Result<Vec<TreeNode>, String>> {
+    let s = session.as_mut()?;
+    if s.key != agent_session_key(profile) {
+        return None;
+    }
+    match s.call(agent_protocol::RequestBody::ReadTreeShallow {
+        root: profile.remote_path.clone(),
+        rel_path: rel_path.to_string(),
+    }) {
+        Ok(agent_protocol::ResponseBody::Tree(nodes)) => Some(Ok(nodes)),
+        Ok(agent_protocol::ResponseBody::Error { message }) => Some(Err(message)),
+        Ok(_) => {
+            *session = None;
+            None
+        }
+        Err(_) => {
+            *session = None;
+            None
+        }
+    }
+}
+
+/// Ends the live agent session and persistent shell session (if any):
+/// asks the agent to exit gracefully first (best-effort), then drops it.
 pub fn agent_disconnect(session: &mut Option<AgentSession>) {
+    shell_disconnect();
     if let Some(mut s) = session.take() {
         let _ = s.call(agent_protocol::RequestBody::Shutdown);
     }
@@ -906,62 +1527,99 @@ fn agent_target_triple(uname: &str) -> Option<&'static str> {
     }
 }
 
-/// Looks for a prebuilt agent binary for `triple` at
-/// `~/.kotoshelf/agent-bin/<triple>/kotoshelf-agent` - the same manual
-/// drop-in location kotoshelf itself checks first (before its own
-/// bundled-resource fallback, which kotoshelf-native has no equivalent
-/// of yet, not being packaged). A binary built for kotoshelf's `agent`
-/// crate works here unmodified - `agent-protocol`/`agent` are identical
-/// between the two projects.
-fn resolve_agent_binary(triple: &str) -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let manual = home.join(".kotoshelf").join("agent-bin").join(triple).join("kotoshelf-agent");
-    if manual.is_file() {
-        return Ok(manual);
+/// Prebuilt Linux x86_64 agent binary embedded directly in the executable
+/// (ported from Tauri's bundled `agent-bin/x86_64-unknown-linux-gnu/kotoshelf-agent`).
+const EMBEDDED_AGENT_LINUX_X86_64: &[u8] =
+    include_bytes!("../assets/agent-bin/x86_64-unknown-linux-gnu/kotoshelf-agent");
+
+/// Resolves the prebuilt agent binary bytes for `triple`:
+/// 1. `~/.kotoshelf/agent-bin/<triple>/kotoshelf-agent` (manual override)
+/// 2. `<exe_dir>/agent-bin/<triple>/kotoshelf-agent` or `assets/agent-bin/<triple>/kotoshelf-agent`
+/// 3. Built-in embedded binary (for `x86_64-unknown-linux-gnu`)
+fn resolve_agent_binary_bytes(triple: &str) -> Result<Vec<u8>, String> {
+    if let Some(home) = dirs::home_dir() {
+        let manual = home.join(".kotoshelf").join("agent-bin").join(triple).join("kotoshelf-agent");
+        if manual.is_file() {
+            return std::fs::read(&manual).map_err(|e| format!("Failed to read {manual:?}: {e}"));
+        }
     }
-    Err(format!("No prebuilt agent binary for {triple} (checked ~/.kotoshelf/agent-bin/{triple}/)"))
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let bundled = exe_dir.join("agent-bin").join(triple).join("kotoshelf-agent");
+            if bundled.is_file() {
+                return std::fs::read(&bundled).map_err(|e| format!("Failed to read {bundled:?}: {e}"));
+            }
+        }
+    }
+    if triple == "x86_64-unknown-linux-gnu" {
+        return Ok(EMBEDDED_AGENT_LINUX_X86_64.to_vec());
+    }
+    Err(format!(
+        "No prebuilt agent binary for {triple} (checked ~/.kotoshelf/agent-bin/{triple}/ and bundled resources)"
+    ))
 }
 
 /// Connects (deploying the agent binary to the remote host first if not
-/// already cached there) and returns the session for `agent_read_tree`
-/// to use. Errors here are meant to be non-fatal to the caller: SSH
-/// still works without an agent via `read_tree`, just slower.
+/// already cached there) and returns the session for `agent_read_tree` /
+/// `agent_read_tree_shallow` to use. Errors here are meant to be non-fatal
+/// to the caller: SSH still works without an agent via `read_tree_shallow`.
 pub fn agent_connect(ssh_command_path: &str, profile: &SshProfile) -> Result<AgentSession, String> {
-    let uname = run_ssh_capture(ssh_command_path, profile, "uname -sm")?;
-    let triple = agent_target_triple(uname.trim())
-        .ok_or_else(|| format!("Unsupported remote platform for the SSH agent: {}", uname.trim()))?;
-    let local_bin = resolve_agent_binary(triple)?;
+    let probe = run_ssh_capture(ssh_command_path, profile, "uname -sm && printf '%s\\n' \"$HOME\"")?;
+    let mut lines = probe.lines();
+    let uname = lines.next().unwrap_or("").trim();
+    let home = lines.next().unwrap_or("").trim();
+    let triple = agent_target_triple(uname)
+        .ok_or_else(|| format!("Unsupported remote platform for the SSH agent: {uname}"))?;
 
-    let home = run_ssh_capture(ssh_command_path, profile, "printf '%s' \"$HOME\"")?;
-    let home = home.trim();
     if home.is_empty() {
         return Err("Could not resolve the remote $HOME".into());
     }
-    let remote_bin = format!("{home}/.kotoshelf/agent/kotoshelf-agent-{}", env!("CARGO_PKG_VERSION"));
+    let agent_dir = format!("{home}/.kotoshelf/agent");
+    let bin_name = format!("kotoshelf-agent-{}", env!("CARGO_PKG_VERSION"));
+    let target_remote_bin = format!("{agent_dir}/{bin_name}");
 
-    let exists = run_ssh_capture(ssh_command_path, profile, &format!("test -x {} && echo OK", shell_quote(&remote_bin)))
-        .map(|s| s.trim() == "OK")
-        .unwrap_or(false);
+    let remote_bin = match resolve_agent_binary_bytes(triple) {
+        Ok(agent_bytes) => {
+            let check_and_cleanup = format!(
+                "(find {} -maxdepth 1 -name 'kotoshelf-agent-*' ! -name {} -delete 2>/dev/null || true) && (test -x {} && echo OK || echo MISSING)",
+                shell_quote(&agent_dir),
+                shell_quote(&bin_name),
+                shell_quote(&target_remote_bin),
+            );
+            let exists = run_ssh_capture(ssh_command_path, profile, &check_and_cleanup)
+                .map(|s| s.lines().last().unwrap_or("").trim() == "OK")
+                .unwrap_or(false);
 
-    if !exists {
-        let bytes = std::fs::read(&local_bin).map_err(|e| format!("Failed to read local agent binary {local_bin:?}: {e}"))?;
-        let script = format!(
-            "mkdir -p {} && cat > {} && chmod +x {}",
-            shell_quote(&format!("{home}/.kotoshelf/agent")),
-            shell_quote(&remote_bin),
-            shell_quote(&remote_bin),
-        );
-        run_ssh_with_stdin(ssh_command_path, profile, &script, &bytes)?;
-    }
-
-    // Best-effort cleanup of binaries from previous versions - failure
-    // doesn't block connecting.
-    let cleanup = format!(
-        "find {} -maxdepth 1 -name 'kotoshelf-agent-*' ! -name {} -delete",
-        shell_quote(&format!("{home}/.kotoshelf/agent")),
-        shell_quote(&format!("kotoshelf-agent-{}", env!("CARGO_PKG_VERSION"))),
-    );
-    let _ = run_ssh_capture(ssh_command_path, profile, &cleanup);
+            if !exists {
+                let script = format!(
+                    "mkdir -p {} && cat > {} && chmod +x {}",
+                    shell_quote(&agent_dir),
+                    shell_quote(&target_remote_bin),
+                    shell_quote(&target_remote_bin),
+                );
+                run_ssh_with_stdin(ssh_command_path, profile, &script, &agent_bytes)?;
+            }
+            target_remote_bin
+        }
+        Err(local_err) => {
+            // If we don't have a local prebuilt binary for this target (e.g.
+            // aarch64-apple-darwin when running on Windows), check if an
+            // existing `kotoshelf-agent-*` is already deployed on the remote
+            // host (e.g. from a previous Tauri release) and reuse it.
+            let find_existing = format!(
+                "for f in {}/kotoshelf-agent-*; do if [ -x \"$f\" ]; then printf '%s\\n' \"$f\"; break; fi; done",
+                shell_quote(&agent_dir),
+            );
+            let existing = run_ssh_capture(ssh_command_path, profile, &find_existing)
+                .ok()
+                .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+                .unwrap_or_default();
+            if existing.is_empty() {
+                return Err(local_err);
+            }
+            existing
+        }
+    };
 
     // Not multiplexed: this one connection stays open for the agent's
     // whole lifetime (ControlMaster reuse doesn't apply), and combining
@@ -1160,5 +1818,74 @@ mod tests {
         assert_eq!(agent_target_triple("Darwin arm64"), Some("aarch64-apple-darwin"));
         assert_eq!(agent_target_triple("Darwin x86_64"), Some("x86_64-apple-darwin"));
         assert_eq!(agent_target_triple("Windows_NT"), None);
+    }
+
+    #[test]
+    fn read_tree_script_uses_gnu_find_printf_with_posix_fallback() {
+        let script = ssh_read_tree_script("./notes");
+        assert!(script.contains("-printf 'D\\t0\\t%P\\n'"));
+        assert!(script.contains("-printf 'F\\t%s\\t%P\\n'"));
+        assert!(script.contains("|| (find . -mindepth 1"));
+    }
+
+    #[test]
+    fn test_connection_verbose_rejects_invalid_remote_folder_immediately() {
+        let mut p = SshProfile::new("bad");
+        p.host = "example.com".to_string();
+        p.remote_path = "../escape".to_string();
+        let res = test_connection_verbose("ssh", &p);
+        assert!(!res.success);
+        assert!(res.summary.contains(".."));
+    }
+
+    #[test]
+    fn ssh_shallow_marks_dirs_unloaded_and_prefixes_base() {
+        let raw = "F\t12\tnote.md\nD\t0\tsub\n";
+        let nodes = parse_ssh_shallow(raw, "notes");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].is_dir);
+        assert_eq!(nodes[0].path, "notes/sub");
+        assert!(nodes[0].children.is_none());
+        assert!(!nodes[1].is_dir);
+        assert_eq!(nodes[1].path, "notes/note.md");
+        assert_eq!(nodes[1].size, 12);
+    }
+
+    #[test]
+    fn tree_splice_helpers_update_loaded_nodes_in_memory() {
+        let mut tree = parse_ssh_shallow("D\t0\tnotes\nF\t10\troot.md\n", "");
+        // Before expanding `notes`, inserting a file under `notes/` leaves `notes` unloaded (`None`).
+        insert_tree_file(&mut tree, "notes/hidden.md", 42);
+        assert!(tree[0].children.is_none());
+
+        // Expand `notes` by splicing its children.
+        let children = parse_ssh_shallow("F\t5\ta.md\n", "notes");
+        insert_tree_children(&mut tree, "notes", children);
+        assert_eq!(tree[0].children.as_ref().unwrap().len(), 1);
+
+        // Insert a new file and a new folder inside `notes`.
+        insert_tree_file(&mut tree, "notes/b.md", 99);
+        insert_tree_dir(&mut tree, "notes/sub");
+        let sub_nodes = tree[0].children.as_ref().unwrap();
+        assert_eq!(sub_nodes.len(), 3);
+        assert_eq!(sub_nodes[0].name, "sub");
+        assert!(sub_nodes[0].is_dir);
+
+        // Rename `notes/b.md` -> `notes/c.md`.
+        assert!(rename_tree_node(&mut tree, "notes/b.md", "notes/c.md"));
+        let names: Vec<&str> = tree[0].children.as_ref().unwrap().iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "a.md", "c.md"]);
+
+        // Remove `notes/a.md`.
+        remove_tree_node(&mut tree, "notes/a.md");
+        let names_after: Vec<&str> = tree[0].children.as_ref().unwrap().iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names_after, vec!["sub", "c.md"]);
+    }
+
+    #[test]
+    fn embedded_linux_x86_64_agent_binary_is_present_and_elf() {
+        let bytes = resolve_agent_binary_bytes("x86_64-unknown-linux-gnu").unwrap();
+        assert!(bytes.len() > 100_000);
+        assert_eq!(&bytes[0..4], b"\x7fELF");
     }
 }

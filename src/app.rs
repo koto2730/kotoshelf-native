@@ -645,6 +645,7 @@ enum NamePromptAction {
 
 enum TreeAction {
     Open(TabPath),
+    ExpandDir { rel_path: String },
     NewFile { dir: TabPath, label: String },
     NewFolder { dir: TabPath, label: String },
     Rename { path: TabPath, name: String },
@@ -673,11 +674,32 @@ struct SshConnectOutcome {
 /// "Open Remote Workspace…" dialog state. Profile CRUD is entirely
 /// local array edits (mirroring the original's `RemoteWorkspaceDialog`,
 /// which does the same against a copy of `AppConfig.sshProfiles`) -
-/// nothing is persisted to `~/.kotoshelf/config.json` until Save/Connect.
+/// nothing is persisted to `~/.kotoshelf/config.json` until Save or Save & Connect.
 struct RemoteDialogState {
     profiles: Vec<ssh::SshProfile>,
     selected: usize,
     ssh_command_path: String,
+    /// Measured height of the right pane so the left pane (list + Add/Remove
+    /// buttons) matches the right pane's vertical height.
+    right_pane_height: f32,
+    /// In-flight `ssh -vT` test receiver when the user clicks "Test".
+    test_pending: Option<std::sync::mpsc::Receiver<ssh::SshTestOutput>>,
+    /// Most recent `ssh -vT` test output for the currently selected profile.
+    test_result: Option<ssh::SshTestOutput>,
+    /// Set to `true` after clicking Copy on the test output.
+    test_copied: bool,
+}
+
+fn collect_tree_file_paths(nodes: &[TreeNode], out: &mut Vec<String>) {
+    for node in nodes {
+        if node.is_dir {
+            if let Some(children) = &node.children {
+                collect_tree_file_paths(children, out);
+            }
+        } else {
+            out.push(node.path.clone());
+        }
+    }
 }
 
 fn ssh_display_target(profile: &ssh::SshProfile) -> String {
@@ -998,18 +1020,60 @@ impl KotoshelfApp {
 
     fn open_remote_dialog(&mut self) {
         let config = ssh::load_app_config();
+        let selected = self
+            .ssh_profile
+            .as_ref()
+            .and_then(|active| {
+                config
+                    .ssh_profiles
+                    .iter()
+                    .position(|p| p.name == active.name && p.host == active.host)
+            })
+            .unwrap_or(0);
         self.remote_dialog = Some(RemoteDialogState {
-            selected: 0,
+            selected,
             profiles: config.ssh_profiles,
             ssh_command_path: config.ssh_command_path,
+            right_pane_height: 220.0,
+            test_pending: None,
+            test_result: None,
+            test_copied: false,
         });
     }
 
+    /// Loads one directory level (`rel_path`) over SSH and splices its
+    /// children into `self.tree` (ported from Tauri's `handleToggleDir`).
+    fn load_ssh_dir_shallow(&mut self, rel_path: &str) {
+        let Some(profile) = self.ssh_profile.clone() else { return };
+        match ssh::read_tree_shallow(&mut self.ssh_agent, &self.ssh_command_path, &profile, rel_path) {
+            Ok(children) => {
+                ssh::insert_tree_children(&mut self.tree, rel_path, children);
+                self.rebuild_wiki_target_set();
+            }
+            Err(e) => self.status = format!("Failed to read directory {rel_path}: {e}"),
+        }
+    }
+
+    /// Returns file paths from `Templates/` at the workspace root for an
+    /// SSH workspace, loading only the root `Templates` directory if it
+    /// hasn't been expanded yet (avoids walking the entire remote workspace).
+    fn ssh_root_template_paths(&mut self) -> Vec<String> {
+        let templates_dir_path = self
+            .tree
+            .iter()
+            .find(|n| n.is_dir && n.name.eq_ignore_ascii_case("templates") && n.children.is_none())
+            .map(|n| n.path.clone());
+        if let Some(dir_path) = templates_dir_path {
+            self.load_ssh_dir_shallow(&dir_path);
+        }
+        let mut out = Vec::new();
+        collect_tree_file_paths(&self.tree, &mut out);
+        out
+    }
+
     /// Kicks off a background thread that connects the tree-read
-    /// accelerator agent (best-effort) and reads the initial tree, then
-    /// polls it via `ssh_connecting` - see that field's doc comment for
-    /// why this can't just block the UI thread like the local
-    /// equivalent (`open_folder`) does.
+    /// accelerator agent (best-effort) and reads the initial root tree
+    /// shallowly (`read_tree_shallow`), then polls it via `ssh_connecting`.
     pub(crate) fn open_ssh_workspace(&mut self, profile: ssh::SshProfile) {
         // Empty / `~` Remote folder = whatever ssh lands in (the login
         // user's home); see `ssh::normalize_remote_folder`.
@@ -1036,12 +1100,24 @@ impl KotoshelfApp {
         std::thread::spawn(move || {
             let mut agent = ssh::agent_connect(&ssh_command_path, &profile).ok();
             let agent_connected = agent.is_some();
-            let tree = match ssh::agent_read_tree(&mut agent, &profile) {
-                Some(result) => result,
-                None => ssh::read_tree(&ssh_command_path, &profile),
-            };
+            let mut tree = ssh::read_tree_shallow(&mut agent, &ssh_command_path, &profile, "");
+            // If a root-level `Templates` folder exists, pre-fetch that single
+            // folder so `ensure_and_open_homepage` can check for
+            // `Templates/template_index.md` without an extra UI-thread round-trip.
+            if let Ok(ref mut nodes) = tree {
+                if let Some(tpl_dir) = nodes
+                    .iter()
+                    .find(|n| n.is_dir && n.name.eq_ignore_ascii_case("templates"))
+                    .map(|n| n.path.clone())
+                {
+                    if let Ok(children) = ssh::read_tree_shallow(&mut agent, &ssh_command_path, &profile, &tpl_dir) {
+                        ssh::insert_tree_children(nodes, &tpl_dir, children);
+                    }
+                }
+            }
             let _ = tx.send(SshConnectOutcome { agent, tree, agent_connected });
-        });        self.ssh_connecting = Some(rx);
+        });
+        self.ssh_connecting = Some(rx);
     }
 
     /// Spawns a terminal outside the app (not embedded) already `cd`'d
@@ -1069,13 +1145,21 @@ impl KotoshelfApp {
 
     fn refresh_tree(&mut self) {
         if let Some(profile) = self.ssh_profile.clone() {
-            let tree = match ssh::agent_read_tree(&mut self.ssh_agent, &profile) {
-                Some(result) => result,
-                None => ssh::read_tree(&self.ssh_command_path, &profile),
-            };
-            match tree {
-                Ok(tree) => {
-                    self.tree = agent_protocol::filter_tree(tree);
+            // Ported from Tauri's `refreshTree`: re-fetch the workspace root
+            // (one level) plus whatever folders were already expanded/loaded,
+            // avoiding a full recursive walk of the entire remote workspace.
+            let mut loaded_dirs = Vec::new();
+            ssh::collect_loaded_dir_paths(&self.tree, &mut loaded_dirs);
+            match ssh::read_tree_shallow(&mut self.ssh_agent, &self.ssh_command_path, &profile, "") {
+                Ok(root_nodes) => {
+                    self.tree = root_nodes;
+                    for dir_path in loaded_dirs {
+                        if let Ok(children) =
+                            ssh::read_tree_shallow(&mut self.ssh_agent, &self.ssh_command_path, &profile, &dir_path)
+                        {
+                            ssh::insert_tree_children(&mut self.tree, &dir_path, children);
+                        }
+                    }
                     self.rebuild_wiki_target_set();
                 }
                 Err(e) => self.status = format!("Failed to refresh workspace: {e}"),
@@ -1102,7 +1186,7 @@ impl KotoshelfApp {
             TabPath::Local(p) => workspace::read_file(&p.to_string_lossy()),
             TabPath::Ssh(rel) => {
                 let profile = self.ssh_profile.as_ref().ok_or("No SSH workspace open")?;
-                ssh::read_file(&self.ssh_command_path, profile, rel)
+                ssh::read_file_text_guarded(&self.ssh_command_path, profile, rel)
             }
         }
     }
@@ -1119,7 +1203,10 @@ impl KotoshelfApp {
             }
             TabPath::Ssh(rel) => {
                 let profile = self.ssh_profile.as_ref().ok_or("No SSH workspace open")?;
-                ssh::write_file(&self.ssh_command_path, profile, rel, content)
+                ssh::write_file(&self.ssh_command_path, profile, rel, content)?;
+                ssh::insert_tree_file(&mut self.tree, rel, content.len() as u64);
+                self.rebuild_wiki_target_set();
+                Ok(())
             }
         }
     }
@@ -1180,6 +1267,7 @@ impl KotoshelfApp {
     fn apply_tree_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::Open(path) => self.open_file(path),
+            TreeAction::ExpandDir { rel_path } => self.load_ssh_dir_shallow(&rel_path),
             TreeAction::NewFile { dir, label } => self.open_new_file_prompt(dir, label),
             TreeAction::NewFolder { dir, label } => self.open_new_folder_prompt(dir, label),
             TreeAction::Rename { path, name } => {
@@ -1369,6 +1457,7 @@ impl KotoshelfApp {
                 TabPath::Ssh(rel) => {
                     if let Some(profile) = &self.ssh_profile {
                         if ssh::trash_path(&self.ssh_command_path, profile, rel).is_ok() {
+                            ssh::remove_tree_node(&mut self.tree, rel);
                             deleted_count += 1;
                         }
                     }
@@ -1376,7 +1465,11 @@ impl KotoshelfApp {
             }
         }
         self.selected_tree_nodes.clear();
-        self.refresh_tree();
+        if self.ssh_profile.is_some() {
+            self.rebuild_wiki_target_set();
+        } else {
+            self.refresh_tree();
+        }
         self.status = format!("Deleted {deleted_count} of {count} items.");
     }
 
@@ -1424,7 +1517,15 @@ impl KotoshelfApp {
                 let new_path = old_path.parent().join(&new_file_name);
                 match self.fs_rename(&old_path, &new_path) {
                     Ok(()) => {
-                        self.refresh_tree();
+                        if let (TabPath::Ssh(from_rel), TabPath::Ssh(to_rel)) = (&old_path, &new_path) {
+                            if ssh::rename_tree_node(&mut self.tree, from_rel, to_rel) {
+                                self.rebuild_wiki_target_set();
+                            } else {
+                                self.refresh_tree();
+                            }
+                        } else {
+                            self.refresh_tree();
+                        }
                         self.status = format!("Renamed to {new_file_name}");
                         for tab in &mut self.tabs {
                             if tab.path.as_ref() == Some(&old_path) {
@@ -1511,7 +1612,9 @@ impl KotoshelfApp {
         let path = dir.join(name);
         match self.fs_write(&path, "") {
             Ok(()) => {
-                self.refresh_tree();
+                if self.ssh_profile.is_none() {
+                    self.refresh_tree();
+                }
                 self.open_file(path);
             }
             Err(e) => self.status = format!("Failed to create file: {e}"),
@@ -1521,7 +1624,13 @@ impl KotoshelfApp {
     fn create_new_folder(&mut self, dir: &TabPath, name: &str) {
         let path = dir.join(name);
         match self.fs_create_dir(&path) {
-            Ok(()) => self.refresh_tree(),
+            Ok(()) => {
+                if let TabPath::Ssh(rel) = &path {
+                    ssh::insert_tree_dir(&mut self.tree, rel);
+                } else {
+                    self.refresh_tree();
+                }
+            }
             Err(e) => self.status = format!("Failed to create folder: {e}"),
         }
     }
@@ -2222,10 +2331,18 @@ pub(crate) fn resolve_media_uri(
     /// in-memory incremental `task_cache` with file `mtime` so unchanged
     /// files skip disk I/O and parsing entirely.
     fn scan_all_tasks(&mut self) -> Result<Vec<dashboard::DueTask>, String> {
-        let is_ssh = self.ssh_profile.is_some();
-        let all_paths: Vec<String> = if let Some(profile) = &self.ssh_profile {
-            ssh::list_all_paths(&self.ssh_command_path, profile)?
-        } else if let Some(dir) = &self.workspace {
+        if let Some(profile) = self.ssh_profile.clone() {
+            let files = ssh::fetch_markdown_files(&self.ssh_command_path, &profile)?;
+            let mut found = Vec::new();
+            for (rel_path, content) in files {
+                if dashboard::is_scannable_extension(&rel_path) {
+                    found.extend(dashboard::tasks_in_file(&rel_path, &content));
+                }
+            }
+            return Ok(found);
+        }
+        let is_ssh = false;
+        let all_paths: Vec<String> = if let Some(dir) = &self.workspace {
             workspace::list_all_paths(&dir.to_string_lossy())
         } else {
             return Err("Open a workspace to list tasks.".to_string());
@@ -2493,14 +2610,8 @@ pub(crate) fn resolve_media_uri(
             self.status = "Open a file to insert a template into.".to_string();
             return;
         }
-        let all_paths: Vec<String> = if let Some(profile) = &self.ssh_profile {
-            match ssh::list_all_paths(&self.ssh_command_path, profile) {
-                Ok(paths) => paths,
-                Err(e) => {
-                    self.status = e;
-                    return;
-                }
-            }
+        let all_paths: Vec<String> = if self.ssh_profile.is_some() {
+            self.ssh_root_template_paths()
         } else if let Some(dir) = &self.workspace {
             workspace::list_all_paths(&dir.to_string_lossy())
         } else {
@@ -3086,7 +3197,15 @@ pub(crate) fn resolve_media_uri(
                     }
                 }
                 self.status = format!("Renamed to {}", to.display_string());
-                self.refresh_tree();
+                if let (TabPath::Ssh(from_rel), TabPath::Ssh(to_rel)) = (old_path, &to) {
+                    if ssh::rename_tree_node(&mut self.tree, from_rel, to_rel) {
+                        self.rebuild_wiki_target_set();
+                    } else {
+                        self.refresh_tree();
+                    }
+                } else {
+                    self.refresh_tree();
+                }
             }
             Err(e) => self.status = format!("Rename failed: {e}"),
         }
@@ -3099,7 +3218,12 @@ pub(crate) fn resolve_media_uri(
         match self.fs_trash(path) {
             Ok(()) => {
                 self.status = format!("Moved {name} to trash");
-                self.refresh_tree();
+                if let TabPath::Ssh(rel) = path {
+                    ssh::remove_tree_node(&mut self.tree, rel);
+                    self.rebuild_wiki_target_set();
+                } else {
+                    self.refresh_tree();
+                }
             }
             Err(e) => self.status = format!("Delete failed: {e}"),
         }
@@ -3309,8 +3433,7 @@ pub(crate) fn resolve_media_uri(
         let is_ssh = self.ssh_profile.is_some();
 
         let all_paths = if is_ssh {
-            let Some(profile) = self.ssh_profile.as_ref().cloned() else { return };
-            ssh::list_all_paths(&self.ssh_command_path, &profile).unwrap_or_default()
+            self.ssh_root_template_paths()
         } else {
             workspace::list_all_paths(&root.display_string())
         };
@@ -3376,7 +3499,9 @@ pub(crate) fn resolve_media_uri(
         let expanded = crate::templates::expand_with_tasks(&template_content, now, &due_tasks);
 
         let _ = self.fs_write(&index_path, &expanded);
-        self.refresh_tree();
+        if !is_ssh {
+            self.refresh_tree();
+        }
         self.open_file(index_path);
     }
 
@@ -3475,7 +3600,6 @@ pub(crate) fn resolve_media_uri(
         let content = tab.content.clone();
         match self.fs_write(&tab_path, &content) {
             Ok(()) => {
-                self.refresh_tree();
                 let tab = &mut self.tabs[tab_index];
                 tab.dirty = false;
                 tab.name = tab_path.file_name();
@@ -4875,40 +4999,96 @@ impl eframe::App for KotoshelfApp {
         }
 
         if let Some(dialog) = &mut self.remote_dialog {
+            if let Some(rx) = &dialog.test_pending {
+                match rx.try_recv() {
+                    Ok(out) => {
+                        dialog.test_result = Some(out);
+                        dialog.test_pending = None;
+                        dialog.test_copied = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ui.ctx().request_repaint();
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        dialog.test_pending = None;
+                    }
+                }
+            }
+
             let mut close_dialog = false;
             let mut save_config = false;
             let mut connect_target = None;
+            let mut run_test_target = None;
             egui::Window::new("Open Remote Workspace")
                 .collapsible(false)
-                .resizable(true)
+                .resizable(false)
+                .default_width(520.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
+                    ui.set_max_width(520.0);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.set_min_width(140.0);
+                            let left_top = ui.cursor().min.y;
+                            ui.set_width(145.0);
+                            ui.set_min_height(dialog.right_pane_height);
                             ui.label("Profiles");
-                            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                                for (i, p) in dialog.profiles.iter().enumerate() {
-                                    let label = if p.name.is_empty() { "(unnamed)" } else { &p.name };
-                                    if ui.selectable_label(dialog.selected == i, label).clicked() {
-                                        dialog.selected = i;
-                                    }
-                                }
-                            });
+                            let list_top = ui.cursor().min.y;
+                            let header_used = (list_top - left_top).max(0.0);
+                            let button_row_h = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 4.0;
+                            let list_height = (dialog.right_pane_height - header_used - button_row_h).clamp(110.0, 260.0);
+
+                            egui::Frame::canvas(ui.style())
+                                .inner_margin(egui::Margin::same(4))
+                                .show(ui, |ui| {
+                                    let inner_h = (list_height - 8.0).max(80.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("ssh_profiles_scroll")
+                                        .min_scrolled_height(inner_h)
+                                        .max_height(inner_h)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.set_min_height(inner_h);
+                                            for (i, p) in dialog.profiles.iter().enumerate() {
+                                                let label = if p.name.is_empty() { "(unnamed)" } else { &p.name };
+                                                if ui.selectable_label(dialog.selected == i, label).clicked() {
+                                                    if dialog.selected != i {
+                                                        dialog.selected = i;
+                                                        dialog.test_result = None;
+                                                        dialog.test_copied = false;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                });
+
                             ui.horizontal(|ui| {
                                 if ui.button("Add").clicked() {
                                     dialog.profiles.push(ssh::SshProfile::new("New Profile"));
                                     dialog.selected = dialog.profiles.len() - 1;
+                                    dialog.test_result = None;
+                                    dialog.test_copied = false;
                                 }
                                 if ui.add_enabled(!dialog.profiles.is_empty(), egui::Button::new("Remove")).clicked() {
                                     dialog.profiles.remove(dialog.selected);
                                     dialog.selected = dialog.selected.saturating_sub(1);
+                                    dialog.test_result = None;
+                                    dialog.test_copied = false;
                                 }
                             });
                         });
-                        ui.separator();
-                        ui.vertical(|ui| {
-                            ui.set_min_width(300.0);
+
+                        let (sep_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(8.0, dialog.right_pane_height.clamp(160.0, 300.0)),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().vline(
+                            sep_rect.center().x,
+                            sep_rect.y_range(),
+                            ui.visuals().widgets.noninteractive.bg_stroke,
+                        );
+
+                        let right_resp = ui.vertical(|ui| {
+                            ui.set_width(355.0);
                             if let Some(profile) = dialog.profiles.get_mut(dialog.selected) {
                                 egui::Grid::new("ssh_profile_form").num_columns(2).show(ui, |ui| {
                                     ui.label("Name");
@@ -4936,7 +5116,7 @@ impl eframe::App for KotoshelfApp {
                                     ui.label("Identity file");
                                     ui.horizontal(|ui| {
                                         let mut idf = profile.identity_file.clone().unwrap_or_default();
-                                        if ui.text_edit_singleline(&mut idf).changed() {
+                                        if ui.add(egui::TextEdit::singleline(&mut idf).desired_width(180.0)).changed() {
                                             profile.identity_file = if idf.is_empty() { None } else { Some(idf) };
                                         }
                                         if ui.button("Browse…").clicked() {
@@ -4958,13 +5138,13 @@ impl eframe::App for KotoshelfApp {
                                         ui.end_row();
                                     } else if rp.is_empty() {
                                         ui.label("");
-                                        ui.weak("Empty = where ssh lands (your home folder, like plain `ssh host`). \"~/sub\" also works.");
+                                        ui.weak("Empty = home folder (\"~\" or \"~/sub\" also works).");
                                         ui.end_row();
                                     } else if rp == "/" {
                                         ui.label("");
                                         ui.colored_label(
                                             egui::Color32::from_rgb(200, 140, 0),
-                                            "⚠ \"/\" opens the server's entire filesystem as the workspace.",
+                                            "⚠ \"/\" opens the entire remote filesystem.",
                                         );
                                         ui.end_row();
                                     }
@@ -4973,49 +5153,128 @@ impl eframe::App for KotoshelfApp {
                                 ui.label("Add a profile to get started.");
                             }
                             ui.separator();
-                            ui.label("SSH command path (blank = \"ssh\" resolved from PATH)");
+                            ui.label("SSH command path (blank = \"ssh\" from PATH)");
                             ui.text_edit_singleline(&mut dialog.ssh_command_path);
                         });
+                        let measured_right_h = right_resp.response.rect.height().clamp(160.0, 300.0);
+                        if (dialog.right_pane_height - measured_right_h).abs() > 1.0 {
+                            dialog.right_pane_height = measured_right_h;
+                            ui.ctx().request_repaint();
+                        }
                     });
+
+                    if dialog.test_pending.is_some() || dialog.test_result.is_some() {
+                        ui.separator();
+                        if dialog.test_pending.is_some() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Running ssh -vT test…");
+                            });
+                        } else if let Some(res) = &dialog.test_result {
+                            let output_to_copy = res.output.clone();
+                            let summary_text = res.summary.clone();
+                            let is_success = res.success;
+                            let mut copy_clicked = false;
+                            ui.horizontal(|ui| {
+                                let copy_label = if dialog.test_copied { "✔ Copied" } else { "📋 Copy" };
+                                if ui
+                                    .button(copy_label)
+                                    .on_hover_text("Copy test output to clipboard")
+                                    .clicked()
+                                {
+                                    copy_clicked = true;
+                                }
+                                let (icon, color) = if is_success {
+                                    ("✔", egui::Color32::from_rgb(40, 160, 60))
+                                } else {
+                                    ("✖", egui::Color32::from_rgb(200, 60, 60))
+                                };
+                                ui.colored_label(color, format!("{icon} {summary_text}"));
+                            });
+                            if copy_clicked {
+                                ui.ctx().copy_text(output_to_copy.clone());
+                                dialog.test_copied = true;
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("ssh_test_output_scroll")
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    let mut out_text = output_to_copy.as_str();
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut out_text)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(500.0)
+                                            .desired_rows(5),
+                                    );
+                                });
+                        }
+                    }
+
                     ui.separator();
                     ui.horizontal(|ui| {
+                        let can_connect = dialog
+                            .profiles
+                            .get(dialog.selected)
+                            .map(|p| !p.host.trim().is_empty() && ssh::check_remote_folder(&p.remote_path).is_ok())
+                            .unwrap_or(false);
+                        let is_testing = dialog.test_pending.is_some();
+                        let test_label = if is_testing { "Testing…" } else { "Test" };
+                        if ui.add_enabled(can_connect && !is_testing, egui::Button::new(test_label)).clicked() {
+                            run_test_target = dialog.profiles.get(dialog.selected).cloned();
+                        }
                         if ui.button("Save").clicked() {
                             save_config = true;
                             close_dialog = true;
                         }
-                        let can_connect = dialog.profiles.get(dialog.selected).map(|p| !p.host.is_empty() && ssh::check_remote_folder(&p.remote_path).is_ok()).unwrap_or(false);
                         if ui.add_enabled(can_connect, egui::Button::new("Connect")).clicked() {
                             connect_target = dialog.profiles.get(dialog.selected).cloned();
+                            close_dialog = true;
+                        }
+                        if ui.add_enabled(can_connect, egui::Button::new("Save & Connect")).clicked() {
+                            save_config = true;
+                            connect_target = dialog.profiles.get(dialog.selected).cloned();
+                            close_dialog = true;
                         }
                         if ui.button("Cancel").clicked() {
                             close_dialog = true;
                         }
                     });
                 });
-            if let Some(profile) = connect_target {
-                let config = ssh::AppConfig {
-                    ssh_profiles: dialog.profiles.clone(),
-                    ssh_command_path: dialog.ssh_command_path.clone(),
-                    ..ssh::load_app_config()
-                };
-                if let Err(e) = ssh::save_app_config(&config) {
-                    self.status = format!("Failed to save SSH profiles: {e}");
+
+            if let Some(profile) = run_test_target {
+                if let Some(dialog) = &mut self.remote_dialog {
+                    let ssh_cmd = dialog.ssh_command_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let out = ssh::test_connection_verbose(&ssh_cmd, &profile);
+                        let _ = tx.send(out);
+                    });
+                    dialog.test_pending = Some(rx);
+                    dialog.test_result = None;
+                    dialog.test_copied = false;
                 }
-                self.ssh_command_path = dialog.ssh_command_path.clone();
-                self.remote_dialog = None;
-                self.open_ssh_workspace(profile);
-            } else if save_config {
-                let config = ssh::AppConfig {
-                    ssh_profiles: dialog.profiles.clone(),
-                    ssh_command_path: dialog.ssh_command_path.clone(),
-                    ..ssh::load_app_config()
-                };
-                if let Err(e) = ssh::save_app_config(&config) {
-                    self.status = format!("Failed to save SSH profiles: {e}");
-                } else {
+            }
+            if save_config {
+                if let Some(dialog) = &self.remote_dialog {
+                    let config = ssh::AppConfig {
+                        ssh_profiles: dialog.profiles.clone(),
+                        ssh_command_path: dialog.ssh_command_path.clone(),
+                        ..ssh::load_app_config()
+                    };
+                    if let Err(e) = ssh::save_app_config(&config) {
+                        self.status = format!("Failed to save SSH profiles: {e}");
+                    } else {
+                        self.ssh_command_path = dialog.ssh_command_path.clone();
+                        self.status = "Saved SSH profiles.".to_string();
+                    }
+                }
+            }
+            if let Some(profile) = connect_target {
+                if let Some(dialog) = &self.remote_dialog {
                     self.ssh_command_path = dialog.ssh_command_path.clone();
                 }
                 self.remote_dialog = None;
+                self.open_ssh_workspace(profile);
             } else if close_dialog {
                 self.remote_dialog = None;
             }
@@ -6669,6 +6928,9 @@ fn show_tree(
                     state.set_open(true);
                 }
             }
+            if is_ssh && state.is_open() && node.children.is_none() && action.is_none() {
+                action = Some(TreeAction::ExpandDir { rel_path: node.path.clone() });
+            }
             let label = node.name.clone();
             let header = state.show_header(ui, |ui| {
                 let resp = ui.selectable_label(is_selected, &node.name);
@@ -6696,6 +6958,8 @@ fn show_tree(
                     if let Some(a) = show_tree(ui, children, is_ssh, root_label, selected_nodes, scroll_pending) {
                         action = Some(a);
                     }
+                } else if is_ssh {
+                    ui.weak("Loading…");
                 }
             });
             header.0.context_menu(|ui| {
