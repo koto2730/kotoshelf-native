@@ -78,10 +78,32 @@ fn resolve_initial_target() -> Option<InitialTarget> {
     }
 }
 
+/// wgpu setup that adapts to weaker GPUs/drivers (e.g. ARM SBCs and phones
+/// whose Vulkan/GLES driver only exposes `max_inter_stage_shader_variables`
+/// = 15, where wgpu's default of 16 makes `request_device` fail with
+/// `LimitsExceeded`).
+///
+/// It keeps egui's own device request untouched and then lowers, per limit,
+/// only the values the adapter can't provide (`or_worse_values_from`), so a
+/// GPU that supports 16 still gets 16 and nothing else changes.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    let default_descriptor = setup.device_descriptor.clone();
+    setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+        let mut descriptor = default_descriptor(adapter);
+        descriptor.required_limits = descriptor.required_limits.or_worse_values_from(&adapter.limits());
+        descriptor
+    });
+    WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(setup), ..Default::default() }
+}
+
 fn main() -> eframe::Result {
     let initial_target = resolve_initial_target();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
@@ -104,4 +126,26 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui_wgpu::wgpu::Limits;
+
+    /// The ARM failure: a driver that only allows 15 inter-stage variables
+    /// must get 15 requested, while a driver that allows 16 keeps 16.
+    #[test]
+    fn requested_limits_are_lowered_only_where_the_adapter_is_weaker() {
+        let requested = Limits::default();
+        assert_eq!(requested.max_inter_stage_shader_variables, 16);
+
+        let weak = Limits { max_inter_stage_shader_variables: 15, ..Limits::default() };
+        let lowered = requested.clone().or_worse_values_from(&weak);
+        assert_eq!(lowered.max_inter_stage_shader_variables, 15);
+        assert_eq!(lowered.max_bind_groups, requested.max_bind_groups);
+
+        let strong = Limits { max_inter_stage_shader_variables: 31, ..Limits::default() };
+        let kept = requested.clone().or_worse_values_from(&strong);
+        assert_eq!(kept.max_inter_stage_shader_variables, 16);
+    }
 }
